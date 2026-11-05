@@ -101,8 +101,13 @@ def build_ckpt(root: str, *, inject_unknown: bool = False) -> None:
 
 
 def run(args: list[str]) -> subprocess.CompletedProcess:
+    # 跟随本测试自己的启动方式。硬写 `-I` 会屏蔽 user site-packages,
+    # 而有的环境(本项目的开发机就是)torch 正装在那儿,子进程会 import 不到 torch,
+    # 于是每一步都以 ModuleNotFoundError 失败、最后在第 5 步崩在缺文件上 ——
+    # 看着像产物没写出来,其实是解释器选错了。
+    argv = [sys.executable] + (["-I"] if sys.flags.isolated else []) + [SCRIPT, *args]
     return subprocess.run(
-        [sys.executable, "-I", SCRIPT, *args], capture_output=True, text=True, cwd=SRC_DIR
+        argv, capture_output=True, text=True, cwd=SRC_DIR
     )
 
 
@@ -179,6 +184,11 @@ try:
     n_changed = n_same = 0
     for fn in sorted(os.listdir(src)):
         if not fn.endswith(".safetensors"):
+            continue
+        if not os.path.exists(os.path.join(dst, fn)):
+            # 第 4 步已经失败了。这里直接记一条,不要再崩在缺文件的 traceback 上 ——
+            # 那个栈会盖掉真正的失败原因。
+            FAILED.append(f"产物缺少分片 {fn}(第 4 步没跑成)")
             continue
         with safe_open(os.path.join(src, fn), framework="pt") as fs, safe_open(
             os.path.join(dst, fn), framework="pt"

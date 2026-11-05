@@ -357,7 +357,21 @@ EP=1 所以全局专家号就是 0..255,**加载侧必须用同一个编号方�
 
 | # | 事 | 验收 |
 |---|---|---|
-| 6.1 | 在 `torchtitan_npu/models/qwen3_5/config_registry.py` 加 35B-A3B 的 trainer 配置(现在只有 `qwen35_27b_4k_sft` 和 `qwen35_27b_long_text_sft` 两个),converter 用 `DeepSeekV4LoRAConverter.Config(rank=16, alpha=32, rank_experts=16, target_modules=())` | 启动日志的 LoRA 行是 `dense=0 grouped=40 rank=16` |
+| 6.1 | 加 35B-A3B 的 LoRA trainer 配置,converter 用 `DeepSeekV4LoRAConverter.Config(rank=16, alpha=32, rank_experts=16, target_modules=())` | 启动日志的 LoRA 行是 `dense=0 grouped=40 rank=16` |
+
+**6.1 的三处修正(2026-11-05 读码核对后)。**
+
+1. **不用改 torchtitan-npu 的文件。** 上游已经有 `qwen35_35b_a3b()`
+   (`third_party/.../qwen3_5/config_registry.py:264`),不需要自己写基座配置。
+   实现放在本仓库的 `src/qwen36_lora_recipe.py`,它把
+   `torchtitan_npu.models.qwen3_5` 的全部名字搬进自己的命名空间,
+   所以可以整体替代 `MODULE=`。那个 clone 里有别人未提交的工作,不要动。
+2. **converter 不是 `Trainer.Config` 的字段**,是
+   `model_registry(flavor, converters=[...])` 的参数
+   (`models/qwen3_5/__init__.py:1100`)。拿到 Trainer.Config 再回头挂是挂不上的。
+3. **并行度必须改。** 上游 `qwen35_35b_a3b()` 是 `tp=2 / ep=8` = **16 rank**,
+   我们只有 8 张卡。改成 `tp=1 / ep=8`,`dp_shard=-1` 推出来是 1,
+   256 个专家摊 8 卡 = 32 个/卡。
 | 6.2 | 冻结非 adapter 参数:抄 `deepseek_v4_1/parallelize.py:238-249` 那 8 行。判据用"模型里有没有名字含 `lora_` 的参数",**不要用 `getattr(model, "lora_config")`** | 日志 `LoRA: 冻结了 N 个非 adapter 参数`;优化器拿到的参数数 == adapter 张量数 |
 | 6.3 | 优化器 AdamW,Muon profile 置 None | 不报 `matched no parameters` |
 | 6.4 | 初始权重 = 阶段 2.5 的 bf16 checkpoint,HF 格式、model-only | 日志无"保持随机初始化" |
@@ -367,6 +381,16 @@ EP=1 所以全局专家号就是 0..255,**加载侧必须用同一个编号方�
 **6.6 的坑有实测代价。** DSv4.1 两个模型目录的 `tokenizer.chat_template`
 **根本没设**,脚本一路静默回退成 5 个 ASCII 字面 token,
 修好后 LoRA 造成的退化从 +13.1 点压到 +3.5 点。
+
+**修正(2026-11-05):训练这条路本身是会响的,范围比上面写的窄。**
+上游 `torchtitan/components/tokenizer.py:89-90` 的 `apply_chat_template`
+在没有模板时直接 `raise ValueError("No chat template set.")`,而
+`hf_datasets/text_datasets.py:489` 就是调它。所以静默回退只会发生在
+**自己写的数据生成脚本**里(DSv4.1 的 `gen_trace.py`),不会发生在
+ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
+而不是 8 卡加载完才炸",外加报告模板是从哪个文件读到的 ——
+`chat_template.jinja` 优先于 `tokenizer_config.json` 里的键
+(tokenizer.py:158-160),两处都有且不同的目录见过。
 
 **rank 怎么选。** adapter 每层参数 = `E × r × (2·dim + 3·moe_inter)`:
 
@@ -384,7 +408,20 @@ EP=1 所以全局专家号就是 0..255,**加载侧必须用同一个编号方�
 | # | 事 | 验收 |
 |---|---|---|
 | 7.1 | 写 `merge_lora.py`(约 60 行):`W_merged = W_hat + (alpha/rank)·B·A`,写 bf16 checkpoint | `diag/merge_bite.py` 复用:数真正变了多少个码。千分之几说明 merge 是空操作 |
-| 7.2 | **`alpha`/`rank` 必须和训练配置一致** | 合并脚本从 adapter 文件 metadata 读并与命令行参数**交叉校验**,不一致就抛 |
+| 7.2 | **`alpha`/`rank` 必须和训练配置一致** | `rank` 从张量形状反推并与 `--rank` 硬校验;`alpha` 必须显式给(无默认值),并记进 `merge_info.json` 和分片 metadata |
+
+**7.2 的验收判据要改,因为情况比原来写的更糟。**
+原判据是"从 adapter 文件 metadata 读 alpha 并交叉校验"。读过
+`adapter_save.py:54` 之后:它写的 metadata 是
+`{"step": ..., "rank": str(_rank())}` —— 那个 `rank` 是**进程 rank**,
+不是 LoRA rank,而 **alpha 根本没有被存进 adapter 文件**。所以:
+
+* LoRA rank 可以从 `w13_lora_a` 的 dim 1 反推,这一条能硬校验。
+* alpha 无法恢复,只能由人给。`merge_lora.py` 的 `--alpha`
+  **刻意不设默认值** —— DSv4.1 的事故正是"有默认值 32.0"造成的。
+* 补偿措施:把实际用的 `rank`/`alpha`/`scaling` 写进输出目录的
+  `merge_info.json` **和**每个分片的 safetensors metadata,
+  让评测端不可能再和训练端分叉。
 | 7.3 | 复评,serve 配置与阶段 3/5 完全一致 | 出数,与同位宽裸版对比 |
 
 **7.2 不是形式主义。** DSv4.1 踩过:`assemble_adapter.py` 的 `--alpha` 默认 32.0,

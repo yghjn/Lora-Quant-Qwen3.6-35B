@@ -107,9 +107,13 @@ env/
 src/
   unisvq_core.py           量化内核:RHT / 码本 / LDLQ / RTN / Hessian 阻尼 / int8 容器
   fakequant_rtn.py         RTN 假量化,HF checkpoint -> bf16 checkpoint
+  qwen36_lora_recipe.py    工单 §6:LoRA trainer 配置(可整体替代 MODULE)
+  prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死
+  merge_lora.py            工单 §7.1/§7.2:adapter 合并回 bf16 checkpoint
 verify/
   test_core_cpu.py         内核自测,24 项,纯 CPU
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
+  test_merge_lora_cpu.py   合并自测,22 项,纯 CPU,参考值用 einsum 独立算
   probe_lora_tree.py       工单 0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境)
 ```
 
@@ -129,7 +133,20 @@ verify/
 | §0.1 LoRA 配置树检查 | 脚本就绪,**待在训练环境执行** |
 | §0.2 下权重 / §0.3 形状预检 | 未做 |
 | §2.2 `offline_ptq.py` | 未做 |
-| §6 LoRA 训练 | 未做 |
+| §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`),**未上卡跑过** |
+| §6.6 语料 + chat template | **完成**,两条路径都冒烟过 |
+| §7.1/§7.2 `merge_lora.py` | **完成**,22 项自测全过 |
+| §6 LoRA 训练本身 | 未做,卡被占 + 训练环境未建 |
+
+### LoRA 线的三件代码就位之后,还差什么
+
+1. **训练环境**(`env/2_pip_train.sh`,要 proxy 关)—— 四道闸门一次都没过。
+2. **§0.1 闸门**:`verify/probe_lora_tree.py`,纯 CPU 不占卡,但需要上面那个环境。
+3. **一张空闲卡**跑 `qwen36_35b_a3b_lora_smoke`(20 步)。
+
+第 3 步之前,`qwen36_lora_recipe.py` 的全部论证都只是静态读码得来的 ——
+见该文件头部"为什么能复用 DSv4 的 LoRA converter"。静态部分已逐条核对到
+行号,但 `convert()` 走完之后配置树长什么样,只有 §0.1 说得清。
 
 ## 实测结果
 
@@ -152,7 +169,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 两个会改排期的发现
+### 三个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -165,7 +182,27 @@ verify/
 所以 2bit 必须等 Hessian 路线(`offline_ptq.py`),不能用 RTN 交付。
 `fakequant_rtn.py` 在 `--bits 2` 时会打这条警告。
 
-**二、纯 CPU 做全量 PTQ 约 8 小时,不是工单里估的 2–4 小时。**
+**二、专家权重朝向:实测布局和 `state_dict_adapter` 期望的正好转置。**
+
+`third_party/torchtitan/torchtitan/models/qwen3_5/state_dict_adapter.py:272-284`
+期望 HF 的 `gate_up_proj` 是 `[E, dim, 2*hidden]` = `[256, 2048, 1024]`,
+在**最后一维**融合,`chunk(2, dim=-1)` 之后转置成 TT 的 `w1_EFD`。
+但 2026-11-05 对官方权重扫描记下的是 `[256, 1024, 2048]` = `[E, 2*hidden, dim]`,
+在**第 1 维**融合。`down_proj` 同理(实测 `[256, 2048, 512]`,adapter 期望
+`[256, 512, 2048]`)。
+
+两者只可能有一个对。后果:
+
+* **工单 §0.4(用上游 flavor 加载真权重)会在 `w1_EFD` 上报 shape mismatch
+  并直接失败** —— 这是响的,不是静默的。真发生了,改的是 `state_dict_adapter`,
+  而且那是上游文件,要走 patch 而不是直接改 clone。
+* `merge_lora.py` 因此**按实际形状判朝向**,不假设。`dim=2048 != 2*hidden=1024`
+  所以判得出来;两者相等时它会拒绝并要求 `--gate-up-layout` 显式指定,
+  自测里有这一项。
+* 量化那一步不受影响:`quant_tensor` 按输出行独立做 qdq,每行自己一套 scale,
+  转置只改"哪一维是组",group 128 两种朝向都整除。
+
+**三、纯 CPU 做全量 PTQ 约 8 小时,不是工单里估的 2–4 小时。**
 按实测单矩阵耗时,每层 256 专家约 12 分钟,40 层约 8 小时(单线程)。
 工单那个估计隐含了用 NPU 做 `ldlq` 里的矩阵乘,而那个 Python 循环
 (n=2048 时 512 次迭代)不随设备变快,所以上卡也压不到 1 小时以下。
@@ -175,12 +212,46 @@ verify/
 
 与卡的可用性解耦,按这个顺序:
 
-1. **不需要卡**:下 Qwen3.6-35B-A3B 权重并逐文件校验(工单 §0.2);
-   `--scan` 核对键名分类;用真 config 重跑形状预检(§0.3)。
-2. **不需要卡**:按 `env/setup_train_env.sh` 建训练环境,
-   跑 `verify/probe_lora_tree.py`(§0.1)。这是整条 LoRA 线的闸门。
-3. **不需要卡**:`fakequant_rtn.py --bits 3` 产出 bf16 checkpoint(§1.1)。
-4. 需要卡:bf16 基线评测、`offline_ptq.py`、LoRA 训练、合并复评。
+1. ~~下权重、核对键名分类、3bit 假量化~~ —— **已完成**,7.1 分钟,
+   SNR min 10.70 / p50 11.12 / max 11.68 dB。
+2. **不需要卡**:建训练环境(`env/2_pip_train.sh`,proxy 要关),
+   跑 `verify/probe_lora_tree.py`(§0.1)。**这是整条 LoRA 线的闸门。**
+3. **不需要卡**:`prepare_corpus.py --tokenizer <tokenizer目录> --synthetic 64`
+   先把 chat template 验死,顺手产出冒烟语料。
+4. 需要一张卡:`qwen36_35b_a3b_lora_smoke`(20 步)。看三件事 ——
+   日志里 `dense=0 grouped=40`、`冻结了 N 个非 adapter 参数`、adapter 分片落盘。
+5. 需要 8 张卡:bf16 基线评测 + 3bit 裸版评测(复用
+   `eval_qwen3.6-35b_vllm`,`HIF4_MODE=off` + `MODEL_PATH` 覆盖,**两次必须给
+   不同的 `TAG`**,否则第二次会 resume 第一次的生成结果)。
+6. 需要 8 张卡:`qwen36_35b_a3b_lora_r16` 正式训练 → `merge_lora.py` → 复评。
+7. 2bit:`offline_ptq.py`(§2.2),RTN 在 2bit 不可用。
+
+## LoRA 训练怎么起
+
+```bash
+export PYTHONPATH=$PWD/src:$PYTHONPATH
+python src/prepare_corpus.py --tokenizer <tokenizer目录> --synthetic 64 --out corpus/smoke.jsonl
+```
+
+```bash
+cd ~/src/torchtitan-npu && NGPU=1 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_smoke HF_ASSETS_PATH=<tokenizer目录> INITIAL_LOAD_PATH=<假量化ckpt> DATA_FILES=<corpus/smoke.jsonl 的绝对路径> ADAPTER_SAVE_DIR=<adapter输出目录> ADAPTER_SAVE_EVERY=20 bash scripts/run_train.sh
+```
+
+`MODULE=qwen36_lora_recipe` 不是 `torchtitan_npu.models.qwen3_5` —— 那个模块的
+全部名字都被搬进了我们这个模块,所以它是**超集**,而 torchtitan-npu 的
+clone 一个文件都不用改(那里有别人未提交的工作)。
+
+训完合并:
+
+```bash
+python src/merge_lora.py --base <假量化ckpt> --adapter <adapter输出目录> --rank 16 --alpha 32 --dry-run
+```
+
+`--alpha` **故意没有默认值**:`adapter_save.py` 写的 metadata 里那个
+`rank` 是**进程 rank**,alpha 根本没存进去。DSv4.1 就是在这里把 delta
+放大了 8 倍(训练日志 alpha=4,评测照默认值传了 32),那批 `3bit+LoRA`
+参照数因此全部不可用。合并后的 `merge_info.json` 和分片 metadata 里会
+记下实际用的 scaling,评测端照它核对。
 
 ## 训练环境安装
 
