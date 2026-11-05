@@ -46,9 +46,12 @@ python -I src/fakequant_rtn.py --in /path/to/Qwen3.6-35B-A3B --scan
 确认分类无歧义后再做 3bit 假量化:
 
 ```bash
-python -I src/fakequant_rtn.py --in /path/to/Qwen3.6-35B-A3B \
-    --out /path/to/qwen36-3bit-rtn --bits 3 --group 128
+python -I src/fakequant_rtn.py --in /path/to/Qwen3.6-35B-A3B --out /path/to/qwen36-3bit-rtn --bits 3 --group 128
 ```
+
+**先看磁盘。** 实测这个 checkpoint 的 26 个分片**每一个都含路由专家**,
+所以全部要重写,产物是一份完整的约 70 GB 副本,不是增量。
+输出目录必须不存在或为空,脚本拒绝覆盖。
 
 产出的是一份 **bf16 的 checkpoint**(量化再反量化),所以任何普通 bf16 推理或
 训练路径都能直接加载,不需要低位宽 kernel。位宽是 Ŵ 的信息量属性,不是容器属性。
@@ -59,12 +62,27 @@ python -I src/fakequant_rtn.py --in /path/to/Qwen3.6-35B-A3B \
 `shared_expert` 一次都没出现,产物按路由专家编号组织,重建只写 FusedMoE 的
 `w13_weight` / `w2_weight`)。
 
-| 部分 | 参数量 | 占比 | 处理 |
-|---|---:|---:|---|
-| 路由专家 | **32.21 G** | **92%** | **量化到 2/3 bit** |
-| embeddings + lm_head | 1.02 G | 3% | 原精度 |
-| attention | 约 0.84 G | 2.4% | 原精度 |
-| 共享专家 | 0.13 G | 0.4% | 原精度 |
+下表是 2026-11-05 对官方权重 `--scan` 的**实测**结果:
+
+| 部分 | 张量数 | 参数量 | 占比 | 处理 |
+|---|---:|---:|---:|---|
+| 路由专家(融合布局) | 80 | **32.212 G** | **89.6%** | **量化到 2/3 bit** |
+| Gated Delta Net(线性注意力) | 240 | 1.012 G | 2.8% | 原精度 |
+| 其余(ViT / embedding / lm_head / 全注意力 / norm / 共享专家) | 725 | 2.728 G | 7.6% | 原精度 |
+
+实测确认的三件事:
+
+* **专家是融合布局**,外面还套了一层多模态前缀:
+  `model.language_model.layers.{i}.mlp.experts.gate_up_proj` 是 `[256, 1024, 2048]`,
+  `down_proj` 是 `[256, 2048, 512]`。80 个张量 = 40 层 × 2,**40 层全是 MoE**。
+  参数量对得上解析式 `40 × 256 × (1024×2048 + 2048×512) = 32.212 G`。
+  融合顺序(`[gate;up]` 还是 `[up;gate]`)对假量化**不影响** —— qdq 按输出行
+  独立做,每行自己一套 scale。顺序只在 LoRA 合并时才要紧。
+* **是混合注意力架构**:40 层里 30 层是 Gated Delta Net(`linear_attn.*`,
+  带 `A_log` / `dt_bias` / `conv1d` 这些 SSM 参数),只有 10 层是全注意力。
+  线性注意力也不量化 —— 它是注意力不是专家,而且 `conv1d.weight` 是
+  `[8192, 1, 4]`,每通道只 4 个元素,`group=128` 除不开。
+* **带 ViT**(`model.visual.*`),本阶段不量化。
 
 `fakequant_rtn.py` 的范围判定**不靠假设**:先 `--scan` 打出分类供人工核对,
 任何"看着像权重但没被分类"的键都会让脚本报错退出。静默跳过会产出一个

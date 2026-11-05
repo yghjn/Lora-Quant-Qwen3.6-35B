@@ -62,6 +62,18 @@ except ImportError:  # 允许 src/ 不在 sys.path 时从同级目录找
 # 路由专家。两种已知布局都覆盖:
 #   逐专家:  model.layers.{i}.mlp.experts.{e}.{gate,up,down}_proj.weight
 #   融合:    model.layers.{i}.mlp.experts.{gate_up,down}_proj[.weight]   (3D: [E, ...])
+#
+# Qwen3.6-35B-A3B 实测(2026-11-05,官方权重)走的是**融合布局**,而且外面套了
+# 一层多模态前缀:
+#   model.language_model.layers.{i}.mlp.experts.gate_up_proj   [256, 1024, 2048]
+#   model.language_model.layers.{i}.mlp.experts.down_proj      [256, 2048, 512]
+# 共 80 个张量(40 层 x 2)、32.212 G 参数,和解析式
+#   40 x 256 x (1024x2048 + 2048x512) = 32.212 G
+# 对得上。1024 = 2 x 512 是 gate 与 up 融合在输出维。
+#
+# **融合顺序([gate;up] 还是 [up;gate])对本脚本不影响**:qdq 是按输出行独立做的,
+# 每行自己一套 scale,gate 行和 up 行不会互相污染。顺序只在 LoRA 合并时才要紧
+# (工单 §4.5 的风险项),到那一步再用 verify_recon.py 定。
 ROUTED_PATTERNS = (
     r"\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$",
     r"\.mlp\.experts\.(gate_up_proj|gate_proj|up_proj|down_proj)(\.weight)?$",
@@ -72,7 +84,16 @@ EXCLUDE_PATTERNS = (
     r"shared_expert",          # 共享专家:原精度
     r"\.mlp\.gate\.",          # router 的 gate
     r"\.mlp\.router\.",
-    r"self_attn|attention",    # attention
+    # 注意力,**所有变体**。写成 `attn\.` 而不是枚举 `self_attn`,是因为
+    # Qwen3.6-35B-A3B 实测是混合架构:40 层里 30 层是 Gated Delta Net
+    # (`layers.N.linear_attn.*`,带 A_log / dt_bias / conv1d 这些 SSM 参数),
+    # 只有 10 层是全注意力。2026-11-05 第一次对真权重扫描时,`self_attn|attention`
+    # 两个都匹配不到 `linear_attn`,240 个张量落进了 unknown —— 守卫因此拦住了,
+    # 这正是它该做的。
+    # 为什么线性注意力也排除:它是注意力不是专家(范围见工单 §1.5);
+    # 只有 1.012 G 参数(2.9%),量到 2bit 省不到 1 GB;而且 conv1d.weight 是
+    # [8192, 1, 4],每通道只有 4 个元素,group=128 除不开,分组量化没有意义。
+    r"attn\.|attention|_attn$",
     r"embed_tokens|tok_embeddings",
     r"lm_head",
     r"norm",                   # RMSNorm / LayerNorm

@@ -82,6 +82,13 @@ def build_ckpt(root: str, *, inject_unknown: bool = False) -> None:
         s3[f"model.layers.{i}.self_attn.q_proj.weight"] = g(D, D)
         s3[f"model.layers.{i}.self_attn.o_proj.weight"] = g(D, D)
         s3[f"model.layers.{i}.input_layernorm.weight"] = g(D)
+        # Gated Delta Net —— 真权重里 40 层有 30 层是这个。放进来是为了让
+        # "被排除的张量逐位未变" 那一项也覆盖到它。
+        s3[f"model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight"] = g(4 * D, D)
+        s3[f"model.language_model.layers.{i}.linear_attn.out_proj.weight"] = g(D, 2 * D)
+        s3[f"model.language_model.layers.{i}.linear_attn.conv1d.weight"] = g(4 * D, 1, 4)
+        s3[f"model.language_model.layers.{i}.linear_attn.A_log"] = g(32)
+        s3[f"model.language_model.layers.{i}.linear_attn.dt_bias"] = g(32)
     if inject_unknown:
         # 看着像权重、但不匹配任何模式 —— 脚本必须拒绝继续
         s3["model.layers.0.mystery_block.proj.weight"] = g(D, D)
@@ -121,6 +128,22 @@ try:
         "model.norm.weight": "excluded",
         "model.layers.0.input_layernorm.weight": "excluded",
         "model.layers.0.mystery_block.proj.weight": "unknown",
+        # --- 以下来自 2026-11-05 对 Qwen3.6-35B-A3B 官方权重的实测键名 ---
+        # 多模态前缀 model.language_model.* + 融合专家布局
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": "routed",
+        "model.language_model.layers.0.mlp.experts.down_proj": "routed",
+        # Gated Delta Net(混合架构里 40 层有 30 层是它)。这几个当初落进了
+        # unknown,因为 self_attn|attention 匹配不到 linear_attn。
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": "excluded",
+        "model.language_model.layers.0.linear_attn.out_proj.weight": "excluded",
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight": "excluded",
+        "model.language_model.layers.0.linear_attn.in_proj_a.weight": "excluded",
+        "model.language_model.layers.0.linear_attn.conv1d.weight": "excluded",
+        "model.language_model.layers.0.linear_attn.A_log": "excluded",
+        "model.language_model.layers.0.linear_attn.dt_bias": "excluded",
+        # ViT
+        "model.visual.blocks.0.mlp.linear_fc1.weight": "excluded",
+        "model.language_model.embed_tokens.weight": "excluded",
     }
     for k, want in cases.items():
         got = FQ.classify(k)
