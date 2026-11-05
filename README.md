@@ -143,6 +143,41 @@ verify/
 3. **不需要卡**:`fakequant_rtn.py --bits 3` 产出 bf16 checkpoint(§1.1)。
 4. 需要卡:bf16 基线评测、`offline_ptq.py`、LoRA 训练、合并复评。
 
+## 训练环境安装
+
+工单阶段 6(LoRA 训练)才需要。量化线用不到。
+
+```bash
+bash env/setup_train_env.sh
+```
+
+脚本会走到底,过四道闸门,每道失败都会打出下一步该查什么:
+
+| 闸门 | 验什么 | 典型失败 |
+|---|---|---|
+| 1 | torch 装上且能 import | 直链被回收 |
+| 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
+| 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`) |
+| 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门 |
+
+全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
+真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令,留给卡空闲时跑。
+
+版本组合(2026-11-05 复查,两个 wheel 都仍可下载):
+
+| 包 | 版本 |
+|---|---|
+| torch | `2.14.0.dev20260719+cpu` cp312 aarch64(直链) |
+| torch_npu | `2.14.0.dev20260808` |
+| triton-ascend | `3.2.1` |
+| spmd_types | `0.2.3`(不是 0.3.0,torchtitan 0.3.0 钉的是这个) |
+
+**torch 和 torch_npu 必须成对换,不要只升一个。** `aten::_scaled_grouped_mm_v2`
+的 `Tensor[]` 参数在 torch nightly 0719 到 0731 之间从 `c10::ArrayRef` 改成了
+`c10::IListRef`,而 `torch_npu dev20260808` 是照 0719 编的 —— 跨过去会在
+`import torch_npu` 时报 `Mismatch in kernel C++ signatures` 直接 abort。
+索引里另有 `torch_npu 2.14.0.dev20260918`,换它就得同步换 torch 的日期。
+
 ## 已知的环境陷阱
 
 这些来自内部的安装记录,换机器前值得先看一眼:
