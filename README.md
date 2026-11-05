@@ -8,23 +8,31 @@ Qwen3.6-35B-A3B 路由专家的低位宽权重量化(2bit / 3bit)+ LoRA 误差�
 
 ## 快速开始
 
-安装分两个阶段,**因为 conda 要走 proxy 而 pip 必须关掉 proxy**:
+安装分两个阶段,**因为 conda 和 pip 对 proxy 的要求相反**:
+conda 要走 proxy,pip 要关掉 proxy。脚本本身不碰任何 proxy 变量,
+由你在两个阶段之间自己开关。
 
 ```bash
-CONDA_PROXY=http://<host>:<port> bash env/1_conda_envs.sh
+bash env/1_conda_envs.sh
 ```
 
 ```bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY && bash env/2_pip_quant.sh
+conda activate lqq-quant && bash env/2_pip_quant.sh
 ```
 
-阶段 1 只建空的 conda 环境,一个包都不装。阶段 2 装包并直接跑两个自测。
-阶段 2 的脚本内部还会用 `env -u` 把 proxy 变量从每个联网命令上再剥一遍,
-所以忘了 `unset` 也没关系;proxy 写在 `~/.bashrc` 里也照样被剥掉。
+阶段 1 只建空的 conda 环境,一个包都不装(**这一步需要 proxy 开着**)。
+阶段 2 装包并直接跑两个自测(**这一步需要 proxy 关掉**),
+它认当前激活的环境,读 `CONDA_PREFIX`,所以激活哪个就装进哪个。
 
 `env/quant.yml` 刻意**不写 `pip:` 段** —— `conda env create` 会在 conda 操作
 内部调 pip,那时 proxy 还开着,两个要求没法在同一个进程里同时满足。
 量化线的 pip 依赖单独放在 `env/quant-requirements.txt`。
+
+手动装也完全可以,阶段 2 等价于:
+
+```bash
+pip install -U pip setuptools wheel && pip install -r env/quant-requirements.txt && python -I verify/test_core_cpu.py && python -I verify/test_fakequant_cpu.py
+```
 
 量化线只要 torch + safetensors,**不需要 NPU、不需要 torchtitan**。
 两个自测都不碰真权重、不占卡,**先让它们过再往下走**。
@@ -73,9 +81,9 @@ docs/
   Qwen3.6-35B-低位宽量化+LoRA-开发工单.md   主文档,带验收判据
   DSv41-Flash-LoRA-训练流程与操作.md        对照:DeepSeek-V4.1 的现行做法
 env/
-  1_conda_envs.sh          阶段 1:只建 conda 环境(**需要 proxy**)
-  2_pip_quant.sh           阶段 2:量化线装包 + 自测(**必须关 proxy**)
-  2_pip_train.sh           阶段 2:训练线装包 + 四道闸门(**必须关 proxy**)
+  1_conda_envs.sh          阶段 1:只建 conda 环境(这一步要 proxy 开)
+  2_pip_quant.sh           阶段 2:量化线装包 + 自测(这一步要 proxy 关)
+  2_pip_train.sh           阶段 2:训练线装包 + 四道闸门(这一步要 proxy 关)
   quant.yml                量化线的 conda 环境,刻意不含 pip 段
   quant-requirements.txt   量化线的 pip 依赖
 src/
@@ -158,14 +166,15 @@ verify/
 
 ## 训练环境安装
 
-工单阶段 6(LoRA 训练)才需要。量化线用不到。同样分两个阶段:
+工单阶段 6(LoRA 训练)才需要。量化线用不到。同样分两个阶段,
+proxy 的开关同上由你控制:
 
 ```bash
-CONDA_PROXY=http://<host>:<port> bash env/1_conda_envs.sh
+bash env/1_conda_envs.sh
 ```
 
 ```bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY && bash env/2_pip_train.sh
+conda activate lqq-train && bash env/2_pip_train.sh
 ```
 
 阶段 1 一次把量化线和训练线两个环境都建好(只要量化线就 `WANT_TRAIN=0`)。
