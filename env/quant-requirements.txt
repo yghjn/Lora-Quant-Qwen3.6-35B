@@ -1,0 +1,8 @@
+# 量化线的 pip 依赖。在**关掉 proxy** 的环境里装 —— 见 env/2_pip_quant.sh。
+#
+# 刻意不钉 torch 的精确版本:量化线只用 torch 的通用算子
+# (linalg.cholesky / solve_triangular / matmul / round),2.7 起都可以。
+# 已在 torch 2.7.1+cpu 上跑过全部自测。**不需要 torch_npu。**
+torch>=2.7
+safetensors>=0.4
+numpy

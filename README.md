@@ -8,15 +8,25 @@ Qwen3.6-35B-A3B 路由专家的低位宽权重量化(2bit / 3bit)+ LoRA 误差�
 
 ## 快速开始
 
-量化线只要 torch + safetensors,**不需要 NPU、不需要 torchtitan**:
+安装分两个阶段,**因为 conda 要走 proxy 而 pip 必须关掉 proxy**:
 
 ```bash
-conda env create -f env/quant.yml
-conda activate lqq-quant
-python -I verify/test_core_cpu.py        # 量化内核自测,24 项
-python -I verify/test_fakequant_cpu.py   # 端到端自测,造合成 checkpoint 跑全流程
+CONDA_PROXY=http://<host>:<port> bash env/1_conda_envs.sh
 ```
 
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY && bash env/2_pip_quant.sh
+```
+
+阶段 1 只建空的 conda 环境,一个包都不装。阶段 2 装包并直接跑两个自测。
+阶段 2 的脚本内部还会用 `env -u` 把 proxy 变量从每个联网命令上再剥一遍,
+所以忘了 `unset` 也没关系;proxy 写在 `~/.bashrc` 里也照样被剥掉。
+
+`env/quant.yml` 刻意**不写 `pip:` 段** —— `conda env create` 会在 conda 操作
+内部调 pip,那时 proxy 还开着,两个要求没法在同一个进程里同时满足。
+量化线的 pip 依赖单独放在 `env/quant-requirements.txt`。
+
+量化线只要 torch + safetensors,**不需要 NPU、不需要 torchtitan**。
 两个自测都不碰真权重、不占卡,**先让它们过再往下走**。
 
 拿到真权重后,第一步是看键名分类对不对(只读 header,不写文件):
@@ -63,8 +73,11 @@ docs/
   Qwen3.6-35B-低位宽量化+LoRA-开发工单.md   主文档,带验收判据
   DSv41-Flash-LoRA-训练流程与操作.md        对照:DeepSeek-V4.1 的现行做法
 env/
-  quant.yml                量化线(torch + safetensors)
-  setup_train_env.sh       LoRA 训练线(torch 2.14 + torchtitan-npu),阶段 6 才需要
+  1_conda_envs.sh          阶段 1:只建 conda 环境(**需要 proxy**)
+  2_pip_quant.sh           阶段 2:量化线装包 + 自测(**必须关 proxy**)
+  2_pip_train.sh           阶段 2:训练线装包 + 四道闸门(**必须关 proxy**)
+  quant.yml                量化线的 conda 环境,刻意不含 pip 段
+  quant-requirements.txt   量化线的 pip 依赖
 src/
   unisvq_core.py           量化内核:RHT / 码本 / LDLQ / RTN / Hessian 阻尼 / int8 容器
   fakequant_rtn.py         RTN 假量化,HF checkpoint -> bf16 checkpoint
@@ -145,13 +158,18 @@ verify/
 
 ## 训练环境安装
 
-工单阶段 6(LoRA 训练)才需要。量化线用不到。
+工单阶段 6(LoRA 训练)才需要。量化线用不到。同样分两个阶段:
 
 ```bash
-bash env/setup_train_env.sh
+CONDA_PROXY=http://<host>:<port> bash env/1_conda_envs.sh
 ```
 
-脚本会走到底,过四道闸门,每道失败都会打出下一步该查什么:
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY && bash env/2_pip_train.sh
+```
+
+阶段 1 一次把量化线和训练线两个环境都建好(只要量化线就 `WANT_TRAIN=0`)。
+阶段 2 装包并过四道闸门,每道失败都会打出下一步该查什么:
 
 | 闸门 | 验什么 | 典型失败 |
 |---|---|---|

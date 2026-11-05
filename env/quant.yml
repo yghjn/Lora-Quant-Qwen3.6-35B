@@ -1,24 +1,14 @@
-# 量化线的 conda 环境。只要 torch + safetensors。
+# 量化线的 conda 环境 —— **只建环境,不装包**。
 #
-#     conda env create -f env/quant.yml
-#     conda activate lqq-quant
-#     python -I verify/test_core_cpu.py
-#     python -I verify/test_fakequant_cpu.py
+# 刻意不写 pip: 段。`conda env create` 会在 conda 操作内部调 pip,而本机的约束是
+# conda 要走 proxy、pip 必须关掉 proxy —— 两者不能在同一个进程里同时满足。
+# 所以包的安装挪到了 env/2_pip_quant.sh(无 proxy 阶段)。
 #
-# 刻意不钉 torch 的精确版本:量化线只用 torch 的通用算子
-# (linalg.cholesky / solve_triangular / matmul / round),2.7 起都可以。
-# 已在 torch 2.7.1+cpu 上跑过全部自测。
-#
-# **不需要 torch_npu**。量化可以纯 CPU 做(实测约 8 小时);
-# 想用 NPU 加速 `ldlq` 里的矩阵乘,再在本环境里按目标机的 CANN 版本
-# 额外装配套的 torch_npu 即可,核心代码不用改(张量的 device 跟着输入走)。
+#     bash env/1_conda_envs.sh      # proxy 开
+#     bash env/2_pip_quant.sh       # proxy 关
 name: lqq-quant
 channels:
   - conda-forge
 dependencies:
   - python=3.10
   - pip
-  - pip:
-      - torch>=2.7
-      - safetensors>=0.4
-      - numpy
