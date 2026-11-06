@@ -107,12 +107,14 @@ env/
 src/
   unisvq_core.py           量化内核:RHT / 码本 / LDLQ / RTN / Hessian 阻尼 / int8 容器
   fakequant_rtn.py         RTN 假量化,HF checkpoint -> bf16 checkpoint
+  offline_ptq.py           工单 §2.2:离线 PTQ(RHT + 码本 + LDLQ),逐专家 Hessian
   qwen36_lora_recipe.py    工单 §6:LoRA trainer 配置(可整体替代 MODULE)
   prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死
   merge_lora.py            工单 §7.1/§7.2:adapter 合并回 bf16 checkpoint
 verify/
   test_core_cpu.py         内核自测,24 项,纯 CPU
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
+  test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,22 项,纯 CPU,参考值用 einsum 独立算
   probe_lora_tree.py       工单 0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境)
 ```
@@ -132,7 +134,8 @@ verify/
 | §1.1 `fakequant_rtn.py` | **完成**,端到端自测全过 |
 | §0.1 LoRA 配置树检查 | 脚本就绪,**待在训练环境执行** |
 | §0.2 下权重 / §0.3 形状预检 | 未做 |
-| §2.2 `offline_ptq.py` | 未做 |
+| §2.2 `offline_ptq.py` | **代码完成**,55 项自测全过;真激活未跑过 |
+| §2.3 单层 dry-run | 合成数据上过了;**真权重 + 真激活未做** |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`),**未上卡跑过** |
 | §6.6 语料 + chat template | **完成**,两条路径都冒烟过 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,22 项自测全过 |
@@ -169,7 +172,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 三个会改排期的发现
+### 五个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -202,7 +205,39 @@ verify/
 * 量化那一步不受影响:`quant_tensor` 按输出行独立做 qdq,每行自己一套 scale,
   转置只改"哪一维是组",group 128 两种朝向都整除。
 
-**三、纯 CPU 做全量 PTQ 约 8 小时,不是工单里估的 2–4 小时。**
+**三、2bit 有一条不需要任何校准数据的可用路线,所以它不再卡在"抓激活"上。**
+
+`offline_ptq.py` 的 `--hessian identity` 下(合成矩阵,`test_offline_ptq_cpu.py` C 段):
+
+| bits | 方法 | SNR | proxy_loss |
+|---:|---|---:|---:|
+| 2 | RTN group128 | 2.35 dB | 6.83e2 |
+| 2 | RHT + 码本(H=I) | **9.11 dB** | **1.45e2** |
+| 2 | RHT + LDLQ(H=I) | 9.11 dB | 1.45e2 |
+| 2 | RHT + LDLQ(真 H) | 8.29 dB | **1.17e2** |
+
+两件事:
+
+* **H=I 时 LDLQ 和"只有码本"的结果逐位相同。** 数学上就该如此 —— 没有非对角
+  结构,误差反馈没有方向可推。所以 `--hessian identity` 买到的是
+  **RHT + 码本**,不是 LDLQ。
+* 但它相对 RTN 已经是 **proxy_loss 降到 21%、SNR +6.8 dB**。
+  也就是说 2bit 的下限不是 RTN 那个 2.35 dB,而是 9 dB 量级,
+  **不需要一个 token 的校准数据**。抓激活那条链(要卡、要跑前向)
+  因此从 2bit 的**阻塞项**降级成**优化项**。
+
+**四、一旦用上真 Hessian,SNR 会下降 —— 那是对的,不是回退。**
+
+上表 2bit:SNR 从 9.11 掉到 8.29 dB,而 proxy_loss 从 1.45e2 降到 1.17e2。
+Hessian 感知量化干的就是这件事:把误差挪到激活不激发的方向上去,
+代价是 `||W - Ŵ||` 变大。
+
+后果是**判据必须换**:跨方法比较时看 `proxy_loss`,不要看 SNR。
+只盯 SNR 的人会把真 Hessian 那一版读成回退,然后往反方向"修"。
+这也是为什么 `--gate-up-order` 弄反特别危险 —— SNR 根本看不见 H 错没错。
+`ptq_manifest.json` 两个都记,比较时用后者。
+
+**五、纯 CPU 做全量 PTQ 约 8 小时,不是工单里估的 2–4 小时。**
 按实测单矩阵耗时,每层 256 专家约 12 分钟,40 层约 8 小时(单线程)。
 工单那个估计隐含了用 NPU 做 `ldlq` 里的矩阵乘,而那个 Python 循环
 (n=2048 时 512 次迭代)不随设备变快,所以上卡也压不到 1 小时以下。
@@ -224,7 +259,37 @@ verify/
    `eval_qwen3.6-35b_vllm`,`HIF4_MODE=off` + `MODEL_PATH` 覆盖,**两次必须给
    不同的 `TAG`**,否则第二次会 resume 第一次的生成结果)。
 6. 需要 8 张卡:`qwen36_35b_a3b_lora_r16` 正式训练 → `merge_lora.py` → 复评。
-7. 2bit:`offline_ptq.py`(§2.2),RTN 在 2bit 不可用。
+7. 2bit:`offline_ptq.py --hessian identity`,**不需要校准数据**,先出一版
+   (发现三);要上真 Hessian 再补抓激活那一步。RTN 在 2bit 不可用。
+
+## 离线 PTQ 怎么跑
+
+```bash
+python src/offline_ptq.py run --in <ckpt> --out <dst> --bits 2 --hessian identity
+```
+
+要用真 Hessian 的话,`--acts` 指向一个目录,每层一个 `layer<NN>.pt`,
+内容是该层 **MoE 输入** 的 hidden states,形状 `[N, dim]`:
+
+```bash
+python src/offline_ptq.py run --in <ckpt> --out <dst> --bits 2 --acts acts/ --layers 20
+```
+
+**抓 hidden states 的那段 hook 不在本仓库**,因为它依赖用哪个框架跑前向,
+而训练环境还没建起来,写了也验不了。除它之外的全部都在:router 本身就是
+checkpoint 里的一个线性层,所以 topk_ids、每专家的 `xe`、
+`a = silu(gate)*up`、两个 Hessian,都由 `offline_ptq.py` 在 CPU 上重算。
+
+两个必须显式确认的开关:
+
+| 开关 | 判错的后果 |
+|---|---|
+| `--layout` | 形状能判出来(2048 != 1024),撞车时拒绝 |
+| `--gate-up-order` | **会静默出错**:顺序反了 `a` 整个变样 → `H2` 错 → w2 量化错,而 SNR 看不出来 |
+
+`--gate-up-order` 的判法:拿一条校准数据,两种顺序各算一次 logits,
+和 bf16 基座对齐的那个是对的;或者直接看官方 modeling 代码。
+实际用的顺序记在 `ptq_manifest.json` 里。
 
 ## LoRA 训练怎么起
 

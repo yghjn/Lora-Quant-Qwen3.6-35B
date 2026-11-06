@@ -303,6 +303,23 @@ RHT + LDLQ + 码本,2bit 裸版 GPQA 还是从 78.28 掉到 48.48。
 | 2.4 | 全量 3bit 量化 | 40 层产物齐,无 `ntok=0` 的 DEGRADED 矩阵 |
 | 2.5 | 写 `write_dequant_ckpt.py`(约 60 行):产物 → bf16 HF checkpoint | 抽查一个专家矩阵,与 `offline_ptq` 内存里的 W_hat 逐位相同 |
 
+**2.2 的边界修正(2026-11-06,代码写完后)。**
+
+原文写"hook MoE block 输入 x **和** router 的 topk_ids"。实际只需要前者:
+**router 就是 checkpoint 里的一个线性层**,拿到 MoE 输入的 hidden states 之后,
+topk_ids、每专家的 `xe`、`a = swiglu(xe @ W13)`、两个 Hessian,全部能在 CPU 上
+用 checkpoint 自己的权重重算。而且只要 ids 不要权重,所以 router 用的是
+softmax 还是 sigmoid、归不归一化都不影响 —— topk 只看 logits 的序。
+
+于是要卡要模型的部分压到只剩**抓各层 MoE 输入的 hidden states**(每层一个
+`[N, dim]`),其余全在 `src/offline_ptq.py` 里且可测(55 项自测)。
+
+**另外补一条原文没有的验收点:`--gate-up-order`。**
+`a = silu(gate) * up`,融合顺序反了 `a` 整个变样,`H2` 跟着错,w2 的量化也错 ——
+**而 SNR 完全看不出来**,因为 SNR 只看 `||W - Ŵ||`,不看 H。这是会静默产出
+垃圾的一类,和 §2.2 里点过的 `cmd.json` 残留导致零 Hessian 是同一类失败。
+判法:一条校准数据两种顺序各算一次 logits,和 bf16 基座对齐的那个是对的。
+
 **2.2 的三处和 DSv4.1 的 `collect()` 不同**(照 `qwen36` 工单 §3.2):
 去掉对 `xe` 和 `a` 的 `npu_dynamic_quant`(bf16 基座没有这一步);
 `swiglu_limit` 为 0 时不 clamp(已兼容);
