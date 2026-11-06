@@ -11,9 +11,17 @@
 
 标记约定:**[已验证]** 是本轮在机器上读代码/算过的;**[假设]** 是还没验证、开工前必须先打正控的。
 
+编号约定:**`§N.M` 只指"阶段 N 的第 M 行工单"**(§D 里那八张表),
+这是代码注释和 README 里引用的那套。叙述性章节用字母:§A 速查、§B 前提、
+§C 设计决定、§D 阶段表、§E 代码清单、§F 风险登记、§G 开工前确认、§H DSv4.1 参照,
+子节如 §B.5、§C.2、§G.1。
+(2026-11-06 改。之前顶层章节也用 0..7,于是 `§2.2` 同时是"离线 PTQ 这个设计决定"
+和"写 offline_ptq.py 这条工单",`§6.1` 同时是"确认 ViT/vocab"和"加 LoRA trainer 配置"
+—— 后一对毫无关系,已经造成过误读。)
+
 ---
 
-## 0. 结论速查
+## A. 结论速查
 
 | 问题 | 答案 |
 |---|---|
@@ -45,9 +53,9 @@
 
 ---
 
-## 1. 已核实的前提
+## B. 已核实的前提
 
-### 1.1 模型定义已经存在,不用自己写 **[已验证]**
+### B.1 模型定义已经存在,不用自己写 **[已验证]**
 
 上游 torchtitan 里有 Qwen3.5-35B-A3B 的完整定义,几何和 Qwen3.6-35B-A3B 一致:
 
@@ -69,9 +77,9 @@
 `qwen36` 包里对 Qwen3.6 fixture 跑的形状预检给出的是同一组数(hidden 2048 /
 moe_inter 512 / 256 专家 / top-k 8 / 40 层),所以两者对得上。
 
-**但那个 flavor 的注释写的是 "MoE config with vision encoder"** —— 见 §6.1。
+**但那个 flavor 的注释写的是 "MoE config with vision encoder"** —— 见 §G.1。
 
-### 1.2 分组专家 LoRA 工厂是架构通用的 **[已验证]**
+### B.2 分组专家 LoRA 工厂是架构通用的 **[已验证]**
 
 这是本路线成立的关键。三件事:
 
@@ -97,7 +105,7 @@ moe_inter 512 / 256 专家 / top-k 8 / 40 层),所以两者对得上。
 `DEEPSEEK_V4_LORA_TARGETS`(dense 层目标清单),而我们设 `target_modules=()`,
 正好把那部分绕开。
 
-### 1.3 显存账:8 卡 × 60 GB **[本轮计算,未实测]**
+### B.3 显存账:8 卡 × 60 GB **[本轮计算,未实测]**
 
 **训练(LoRA,bf16 基座):**
 
@@ -139,7 +147,7 @@ Qwen3.6 的路由专家只有 32.21 G 参数,是它的 1/16.9。这个约束在�
 都放持久盘,**不要放 `/run`** —— DSv4.1 风险登记里排第一的就是
 "tmpfs 重启全失(已发生两次)"。
 
-### 1.4 可复用的量化内核 **[已验证]**
+### B.4 可复用的量化内核 **[已验证]**
 
 `/home/ma-user/work/l84414662/qwen36/quant/core.py`,140 行,
 **纯 torch,无自定义 kernel**。模块文档自述对齐 `lc_qat_torch` 的语义:
@@ -158,7 +166,7 @@ Qwen3.6 的路由专家只有 32.21 G 参数,是它的 1/16.9。这个约束在�
 形状整除性:Qwen3.6 的 1024 / 2048 / 512 都被 128 和 4 整除,
 **不需要补零、不需要动 Hadamard 阶数**(`qwen36` 的形状预检已验证)。
 
-### 1.5 量化范围:只做路由专家 **[已验证]**
+### B.5 量化范围:只做路由专家 **[已验证]**
 
 DSv4.1 的低位宽量化**只针对路由专家**,Qwen3.6 照此办理。
 
@@ -193,15 +201,15 @@ Qwen3.6-35B-A3B 的参数分布:
    **训出来的模型和能部署的模型就不是同一个**(实测 936 个键里 736 个是这类)。
    所以 `target_modules=()` 不是省事,是和量化范围对齐。
 3. **混合精度回退也在这个范围内做。** `mp_select.py` 挑的是**热路由专家**,
-   让其中约 10% 保持高精度,这是 2bit 下最大的那个杠杆(见 §4)。
+   让其中约 10% 保持高精度,这是 2bit 下最大的那个杠杆(见阶段 4)。
 
 ---
 
-## 2. 三个设计决定
+## C. 三个设计决定
 
 和 DSv4.1 不同的地方只有这三处,其余都是照搬或不做。
 
-### 2.1 不做 int8 冻结基座,全程 bf16
+### C.1 不做 int8 冻结基座,全程 bf16
 
 **DSv4.1 的做法:** 把 2bit 重建出的 W_hat 按输出通道烘成 int8 存进参数,
 前向时现场反量化回 bf16 再做 matmul。配套 `moe_int8.py`(property 反量化)
@@ -229,7 +237,7 @@ DSv4.1:  W_deploy = quant_int8( dequant(W_nbit) + (alpha/rank)·B·A )
 要补回来只需在合并后加一次 `core.py` 的 `requant_int8_perchannel`,
 **不影响本工单任何其他步骤**。
 
-### 2.2 不寄生推理引擎,离线 PTQ
+### C.2 不寄生推理引擎,离线 PTQ
 
 **DSv4.1 的做法:** 量化发生在 vLLM 服务进程内部。hook 打进
 `vllm_ascend/quantization/methods/w8a8_dynamic.py` 的三个源码锚点,
@@ -248,7 +256,7 @@ DSv4.1:  W_deploy = quant_int8( dequant(W_nbit) + (alpha/rank)·B·A )
 `cmd.json` 残留会让新服务在**零 Hessian** 下静默写出垃圾分片
 (SNR 看着仍有 9 dB,事后极难发现)。
 
-### 2.3 PTQ 按层在单卡串行
+### C.3 PTQ 按层在单卡串行
 
 只把第 L 层驻留在卡上,喂上一层(已量化)输出的隐状态,
 收 Hessian、量化、写产物,再前向产出下一层的输入。标准 GPTQ 式串行。
@@ -265,7 +273,7 @@ DSv4.1:  W_deploy = quant_int8( dequant(W_nbit) + (alpha/rank)·B·A )
 
 ---
 
-## 3. 阶段与工单
+## D. 阶段与工单
 
 ### 阶段 0:基线与加载验证(不占卡的部分先做)
 
@@ -301,7 +309,7 @@ RHT + LDLQ + 码本,2bit 裸版 GPQA 还是从 78.28 掉到 48.48。
 | 2.2 | 写 `offline_ptq.py`(约 200 行):按层串行,hook MoE block 输入 x 和 router 的 topk_ids,逐专家累 `H13 += xe^T xe` 和 `H2 += a^T a`(a = swiglu(xe @ W13)),调 `core.unisvq_qdq`,写分片 | 单层 dry-run:40 层里挑 1 层跑完,产物键名齐全,每矩阵 SNR 入账 |
 | 2.3 | **单层 dry-run 不能省** | SNR 落在合理区间,`proxy_loss` 单调下降 |
 | 2.4 | 全量 3bit 量化 | 40 层产物齐,无 `ntok=0` 的 DEGRADED 矩阵 |
-| 2.5 | 写 `write_dequant_ckpt.py`(约 60 行):产物 → bf16 HF checkpoint | 抽查一个专家矩阵,与 `offline_ptq` 内存里的 W_hat 逐位相同 |
+| 2.5 | ~~写 `write_dequant_ckpt.py`:产物 → bf16 HF checkpoint~~ **已被 2.2 覆盖**,改为写抽查脚本 `verify/recheck_ptq_shard.py` | 从产物目录读回一个专家矩阵,用同一 `--bits/--damp/--gate-up-order` 重跑 `quantize_layer`,与写出值逐位相同 |
 
 **2.2 的边界修正(2026-11-06,代码写完后)。**
 
@@ -317,10 +325,17 @@ softmax 还是 sigmoid、归不归一化都不影响 —— topk 只看 logits �
 **另外补一条原文没有的验收点:`--gate-up-order`。**
 `a = silu(gate) * up`,融合顺序反了 `a` 整个变样,`H2` 跟着错,w2 的量化也错 ——
 **而 SNR 完全看不出来**,因为 SNR 只看 `||W - Ŵ||`,不看 H。这是会静默产出
-垃圾的一类,和 §2.2 里点过的 `cmd.json` 残留导致零 Hessian 是同一类失败。
+垃圾的一类,和 §C.2 里点过的 `cmd.json` 残留导致零 Hessian 是同一类失败。
 判法:一条校准数据两种顺序各算一次 logits,和 bf16 基座对齐的那个是对的。
 
-**2.2 的三处和 DSv4.1 的 `collect()` 不同**(照 `qwen36` 工单 §3.2):
+**2.5 的变更(2026-11-06)。**
+原条目假设 PTQ 先吐一个中间产物格式,再由 `write_dequant_ckpt.py` 转成 HF
+checkpoint。实际 `offline_ptq.py run` **直接写出完整的 bf16 HF 目录**:被量化的
+分片重写,其余分片和非 safetensors 文件原样 `copy2`(见 `src/offline_ptq.py`
+的"写出"段)。没有中间产物,也就没有这一步转换。原验收判据只剩后半句还成立
+—— 抽查一个矩阵是否逐位相同,那是个校验脚本,不是 60 行的转换器。
+
+**2.2 的三处和 DSv4.1 的 `collect()` 不同**(照 `l84414662/qwen36/QWEN36_ADAPTATION.md` §3.2):
 去掉对 `xe` 和 `a` 的 `npu_dynamic_quant`(bf16 基座没有这一步);
 `swiglu_limit` 为 0 时不 clamp(已兼容);
 EP=1 所以全局专家号就是 0..255,**加载侧必须用同一个编号方案** ——
@@ -444,11 +459,11 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 **7.2 不是形式主义。** DSv4.1 踩过:`assemble_adapter.py` 的 `--alpha` 默认 32.0,
 当时没显式传,adapter metadata 记成 32.0,而训练日志是 4.0,
 评测又照 metadata 传了 32 —— **实际加上去的 delta 比训练时学到的放大了 8 倍**。
-见 §7 的参照表脚注。
+见 §H 的参照表脚注。
 
 ---
 
-## 4. 代码清单
+## E. 代码清单
 
 ### 原样复用(不改一行)
 
@@ -476,7 +491,7 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 |---|---|---|
 | `fakequant_rtn.py` | 阶段 1 的一次性脚手架 | ~80 |
 | `offline_ptq.py` | 按层串行 Hessian + 量化 + 写分片 | ~200 |
-| `write_dequant_ckpt.py` | 产物 → bf16 HF checkpoint | ~60 |
+| ~~`write_dequant_ckpt.py`~~ | **不写了**,`offline_ptq.py` 直接出 HF 目录;换成 `verify/recheck_ptq_shard.py` 抽查 | ~40 |
 | `merge_lora.py` | 合并 adapter → bf16 checkpoint | ~60 |
 
 **新代码合计约 400 行**(含脚手架;不含脚手架约 320)。
@@ -495,7 +510,7 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 
 ---
 
-## 5. 风险登记
+## F. 风险登记
 
 | 风险 | 性质 | 处置 |
 |---|---|---|
@@ -511,18 +526,18 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 
 ---
 
-## 6. 开工前必须确认的四件事 **[假设]**
+## G. 开工前必须确认的四件事 **[假设]**
 
 | # | 要确认什么 | 怎么确认 | 不成立的后果 |
 |---|---|---|---|
-| 6.1 | 上游 `_35b_a3b` 注释写 "with vision encoder",vocab 248320。Qwen3.6-35B-A3B 的真实 vocab 和是否带 ViT 要核 | 读真 config.json;看 `qwen3_5/state_dict_adapter.py` 的键映射 | 要么找纯文本 flavor,要么自己加一个 |
-| 6.2 | `LoRAConverter` 的配置树遍历能否在 Qwen 的层结构下找到 `GroupedExperts.Config` | §0.1,纯 CPU | 要改 converter 的树遍历 |
-| 6.3 | HF checkpoint 里专家权重是融合 `[gate;up]` 还是分开的 `gate_proj`/`up_proj`/`down_proj` | 读一个分片的键名 | 决定 `offline_ptq` 和 `merge_lora` 的切分逻辑 |
-| 6.4 | Qwen3.6 的实际推理长度(定 `TRACE_MAXTOK`) | 生成 50 条看 `reasoning_tokens` 的中位和 p75 | 截断比例过高,语料质量塌 |
+| G.1 | 上游 `_35b_a3b` 注释写 "with vision encoder",vocab 248320。Qwen3.6-35B-A3B 的真实 vocab 和是否带 ViT 要核 | 读真 config.json;看 `qwen3_5/state_dict_adapter.py` 的键映射 | 要么找纯文本 flavor,要么自己加一个 |
+| G.2 | `LoRAConverter` 的配置树遍历能否在 Qwen 的层结构下找到 `GroupedExperts.Config` | §0.1,纯 CPU | 要改 converter 的树遍历 |
+| G.3 | HF checkpoint 里专家权重是融合 `[gate;up]` 还是分开的 `gate_proj`/`up_proj`/`down_proj` | 读一个分片的键名 | 决定 `offline_ptq` 和 `merge_lora` 的切分逻辑 |
+| G.4 | Qwen3.6 的实际推理长度(定 `TRACE_MAXTOK`) | 生成 50 条看 `reasoning_tokens` 的中位和 p75 | 截断比例过高,语料质量塌 |
 
 ---
 
-## 7. 附:DSv4.1 的实测参照
+## H. 附:DSv4.1 的实测参照
 
 拿来当靶子,**不是预期值** —— Qwen3.6 的专家矩阵小一个量级,2bit 预期掉得更多。
 

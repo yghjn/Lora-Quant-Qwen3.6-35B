@@ -7,7 +7,7 @@
 
 相对原版只改两处:
   1. `N_BITS` 从模块常量改成读 `UNISVQ_NBITS` 环境变量(原版写死 2,
-     会让验证脚本和生产跑的位宽不一致 —— 这是 qwen36 工单 §1.3 点出的问题)。
+     会让验证脚本和生产跑的位宽不一致 —— 这是 `l84414662/qwen36/QWEN36_ADAPTATION.md` §1.3 点出的问题)。
   2. `LinearCodebook` 的 `bits` 默认跟随 `N_BITS`,并在 `unisvq_qdq` 里
      不再隐含位宽 —— 位宽只由传进来的 codebook 决定,避免两处不一致。
 

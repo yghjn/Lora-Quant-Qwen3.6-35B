@@ -81,11 +81,11 @@ def _lora_converters(rank: int, alpha: float) -> list:
     **没有 int8 冻结基座,这条链只有一环。** DSv4.1 需要 int8 是因为 543.6 B
     路由专家 bf16 按 16 片摊 = 68.1 GiB/die 超过 61.27 GiB 容量;Qwen3.6 的
     路由专家是 32.2 G 参数,bf16 全模型约 70 GB,8 卡摊下来 8.75 GB/卡,
-    bf16 直接装得下(工单 §2.1)。所以也就不存在 DSv4.1 那个
+    bf16 直接装得下(工单 §C.1)。所以也就不存在 DSv4.1 那个
     "Int8FrozenBaseConverter 排后面就静默变成 bf16 基座"的顺序坑。
 
     ``target_modules=()`` 即不给 dense 层加 adapter。理由和 DSv4.1 一样:
-    量化只做了路由专家(工单 §1.5),attention / router 没被动过,
+    量化只做了路由专家(工单 §B.5),attention / router 没被动过,
     给它们加 adapter 等于训出一个部署时用不上的模型 —— DSv4.1 实测 936 个
     adapter 键里 736 个是这类白训的。
 

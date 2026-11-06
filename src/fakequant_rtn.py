@@ -73,7 +73,7 @@ except ImportError:  # 允许 src/ 不在 sys.path 时从同级目录找
 #
 # **融合顺序([gate;up] 还是 [up;gate])对本脚本不影响**:qdq 是按输出行独立做的,
 # 每行自己一套 scale,gate 行和 up 行不会互相污染。顺序只在 LoRA 合并时才要紧
-# (工单 §4.5 的风险项),到那一步再用 verify_recon.py 定。
+# (工单 §F 风险登记的"`w13` 融合顺序猜错"),到那一步再用 verify_recon.py 定。
 ROUTED_PATTERNS = (
     r"\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$",
     r"\.mlp\.experts\.(gate_up_proj|gate_proj|up_proj|down_proj)(\.weight)?$",
@@ -90,7 +90,7 @@ EXCLUDE_PATTERNS = (
     # 只有 10 层是全注意力。2026-11-05 第一次对真权重扫描时,`self_attn|attention`
     # 两个都匹配不到 `linear_attn`,240 个张量落进了 unknown —— 守卫因此拦住了,
     # 这正是它该做的。
-    # 为什么线性注意力也排除:它是注意力不是专家(范围见工单 §1.5);
+    # 为什么线性注意力也排除:它是注意力不是专家(范围见工单 §B.5);
     # 只有 1.012 G 参数(2.9%),量到 2bit 省不到 1 GB;而且 conv1d.weight 是
     # [8192, 1, 4],每通道只有 4 个元素,group=128 除不开,分组量化没有意义。
     r"attn\.|attention|_attn$",
