@@ -111,11 +111,13 @@ src/
   qwen36_lora_recipe.py    工单 §6:LoRA trainer 配置(可整体替代 MODULE)
   prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死
   merge_lora.py            工单 §7.1/§7.2:adapter 合并回 bf16 checkpoint
+  mp_select.py             工单 §4.1:按路由计数挑热专家 + 位宽账(--bits-table)
 verify/
   test_core_cpu.py         内核自测,24 项,纯 CPU
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,22 项,纯 CPU,参考值用 einsum 独立算
+  test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
   probe_lora_tree.py       工单 0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境)
 ```
 
@@ -142,6 +144,9 @@ verify/
 | §2.3 单层 dry-run | 合成数据上过了;**真权重 + 真激活未做** |
 | §2.4 全量 40 层量化 | 未做,等真权重 + 真激活 |
 | §2.5 `write_dequant_ckpt.py` | **不写了** —— `offline_ptq.py run` 直接写出完整 bf16 HF 目录,没有中间产物;只差一个抽查脚本 |
+| §4.1 `mp_select.py` 挑热专家 | **代码完成**,60 项自测全过;真激活未跑过 |
+| §4.2 `--keep-hot` 跳过热专家 | **代码完成**,保留专家逐位直通已验 |
+| §4.3 混精评测 | 未做,卡被占 |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`),**未上卡跑过** |
 | §6.6 语料 + chat template | **完成**,两条路径都冒烟过 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,22 项自测全过 |
@@ -178,7 +183,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 五个会改排期的发现
+### 六个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -249,6 +254,24 @@ Hessian 感知量化干的就是这件事:把误差挪到激活不激发的方�
 (n=2048 时 512 次迭代)不随设备变快,所以上卡也压不到 1 小时以下。
 **排期按卡的可用性分两档写。**
 
+**六、DSv4.1 那个 2.609 bit 是 int8 口径,本路线照抄保留比例会变成 3.42 bit。**
+
+`model_cfg.py` 的 `bits(K) = N_BITS + (8 - N_BITS)·K/E` —— 保留的专家存 **int8**。
+本路线全程 bf16(工单 §C.1),保留的是 16 bit:
+
+| 配置 | 保留比 | 平均位宽 | 产物 |
+|---|---:|---:|---:|
+| DSv4.1 hot39/384 保 int8(**65.66 GPQA 就是这个点**) | 10.16% | 2.609 bit | — |
+| 同保留比例 hot26 保 bf16 | 10.16% | **3.422 bit** | 13.78 GB |
+| 同位宽预算 hot11 保 bf16 | 4.30% | 2.602 bit | 10.48 GB |
+
+所以"2bit + hot26 回退"在本路线是个 **3.42 bit** 的模型。拿它的分数和 65.66 比,
+是拿高了 0.81 bit 的模型去比。要同预算比,用 **hot11**。
+`python src/mp_select.py --bits-table --experts 256 --bits 2` 直接打这张表。
+
+顺带两件:bf16 保留让 2bit 产物从 8.05 GB 涨到 13.78 GB(几乎翻倍);
+3bit 基座下 DSv4.1 **没有**混精的公开数,所以那一行只能当推算值,不能当靶子。
+
 ## 下一步
 
 与卡的可用性解耦,按这个顺序:
@@ -267,6 +290,10 @@ Hessian 感知量化干的就是这件事:把误差挪到激活不激发的方�
 6. 需要 8 张卡:`qwen36_35b_a3b_lora_r16` 正式训练 → `merge_lora.py` → 复评。
 7. 2bit:`offline_ptq.py --hessian identity`,**不需要校准数据**,先出一版
    (发现三);要上真 Hessian 再补抓激活那一步。RTN 在 2bit 不可用。
+8. 2bit 混精:`mp_select.py` 挑热专家 → `offline_ptq.py --keep-hot`。
+   **这一步必须有真激活**(路由计数没有 H=I 那种免校准退路),但它要的
+   token 数比 Hessian 少得多 —— 计数稳定比 `xe^T xe` 稳定容易。
+   先定用 hot11(同位宽预算)还是 hot26(同保留比例),见发现六。
 
 ## 离线 PTQ 怎么跑
 
@@ -296,6 +323,28 @@ checkpoint 里的一个线性层,所以 topk_ids、每专家的 `xe`、
 `--gate-up-order` 的判法:拿一条校准数据,两种顺序各算一次 logits,
 和 bf16 基座对齐的那个是对的;或者直接看官方 modeling 代码。
 实际用的顺序记在 `ptq_manifest.json` 里。
+
+## 混合精度怎么挑
+
+```bash
+python src/mp_select.py --bits-table --experts 256 --bits 2
+```
+
+先看这张位宽账再动手 —— 选 hot11 还是 hot26 决定了产物能不能和 DSv4.1 的数比
+(发现六)。然后:
+
+```bash
+python src/mp_select.py --in <ckpt> --acts acts/ --out keep_hot11.json -k 11
+python src/offline_ptq.py run --in <ckpt> --out <dst> --bits 2 --acts acts/ --keep-hot keep_hot11.json
+```
+
+`mp_select.py` 同时出 `hot` 和 `cold` 两个变体(cold = 校准 token 最少的 K 个,
+Hessian 样本最少、2bit 误差最大;是个便宜的对照假设,不是主路径),
+外加一个 `*_info.json` 记两种口径的平均位宽和并列打破方式。
+
+`--keep-hot` 会挡掉三类静默失败:专家号越界、某层保留了全部专家、
+值不是整数列表(把 `*_info.json` 当 keep 传)。**要量化的层不在 keep 里**
+只警告不拦,但会明说那层整层走低位宽 —— 这条原版列为"缺层"自检。
 
 ## LoRA 训练怎么起
 

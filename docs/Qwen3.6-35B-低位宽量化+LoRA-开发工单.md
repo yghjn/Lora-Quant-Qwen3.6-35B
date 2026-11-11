@@ -47,7 +47,7 @@
 | tmpfs 腾挪、jemalloc 调参、启动重试 | **不需要** | 产物 7.5 GiB,放持久盘 |
 | EP 分片导致 Hessian 只用 1/16 路由量 | **不存在** | EP=1 全量收集 |
 | UniSVQ 算法本体(RHT / 码本 / LDLQ) | **原样保留** | 这是真正干活的部分 |
-| 混合精度热专家回退(`mp_select.py`) | **保留并提前** | 2bit 下是主路径,不是优化项 |
+| 混合精度热专家回退(`mp_select.py`) | **重写并提前** | 2bit 下是主路径;输入从寄生 collector 的路由计数换成 `--acts` + router 权重 |
 | `target_modules=()`,LoRA 只加路由专家 | **保留** | 否则训出来的和能部署的不是同一个模型 |
 | `adapter_save.py` 显式保存 adapter | **保留** | 不存就是白训 |
 
@@ -360,11 +360,54 @@ EP=1 所以全局专家号就是 0..255,**加载侧必须用同一个编号方�
 **2.609 bit 带回退比 3.000 bit 均摊更好。** 把 0.39 bit 平摊给全部专家,
 不如让 10% 的热专家保持精确。
 
+**但那个 2.609 的口径是 int8。** `model_cfg.py` 的
+`bits(K) = N_BITS + (8 - N_BITS)·K/E` —— 保留的专家存成 **int8**,
+所以 `2 + 6×39/384 = 2.609`。本路线全程 bf16(§C.1),保留的专家是 16 bit,
+同样的保留比例算出来是 `2 + 14×26/256 = 3.422 bit`。**差 0.81 bit,
+不是同一个工作点。** 详见下面 4.1/4.2 的修正。
+
 | # | 事 | 验收 |
 |---|---|---|
-| 4.1 | 复用 `mp_select.py` 按校准集路由计数挑热专家,256 的 10% 约 26 个/层。**它有拓扑硬校验**,混进 DSv4.1 的数据会立刻失败,所以要先改拓扑常量 | 产出 `keep_hot26.json`,每层 26 个专家 |
-| 4.2 | 量化时跳过热专家,保持 bf16(或 int8) | 平均位宽按 `NB + (26/256)·(16 - NB)` 记入 TAG |
+| 4.1 | 写 `src/mp_select.py`:按校准集路由计数挑热专家。**输入不是原版那个 `route_calib_e*.json`**(那是寄生 collector 的产物,本路线没有),而是 `--acts` + checkpoint 自带的 router 权重,用 `offline_ptq.route()` 现算 | 产出 `keep_hot<K>.json`,每层恰好 K 个专家;常量激活夹具下 hot 列表**精确等于**被路由命中的专家号 |
+| 4.2 | `offline_ptq.py --keep-hot`:列进来的专家不量化、原权重直通 | 保留的专家矩阵与源**逐位相同**;平均位宽 `NB + (16-NB)·K/E` 记进 `ptq_manifest.json` 和分片 metadata(`ptq_avg_bits`),TAG 照这个数起 |
 | 4.3 | 评测 | 出数 |
+
+**4.1/4.2 的修正(2026-11-07,代码写完后)。**
+
+**一、原文的验收公式对,但那个工作点和 DSv4.1 的不可比。**
+`NB + (26/256)·(16 - NB)` 是本路线(bf16 保留)的正确算法,结果 **3.422 bit**。
+而 DSv4.1 公开的 65.66 是 **2.609 bit**(int8 保留)。三个可比的点:
+
+| 配置 | 保留比 | 平均位宽 | 产物 |
+|---|---:|---:|---:|
+| DSv4.1 hot39/384 保 int8(**65.66 就是这个点**) | 10.16% | 2.609 bit | — |
+| 同保留比例 hot26 保 bf16 | 10.16% | **3.422 bit** | 13.78 GB |
+| 同保留比例 hot26 保 int8 | 10.16% | 2.609 bit | 10.51 GB |
+| 同位宽预算 hot11 保 bf16 | 4.30% | 2.602 bit | 10.48 GB |
+
+拿 hot26-bf16 的分数去和 65.66 比,是拿高了 0.81 bit 的模型去比,**赢了不说明
+方法更好**。要同预算比就用 **hot11**;要同保留比例就得上 int8 容器
+(`core.requant_int8_perchannel` 一行,但那是 §C.1 明确不做的事)。
+`src/mp_select.py --bits-table` 把三个点都打出来,选哪个是人的决定。
+
+顺带:bf16 保留让 2bit 产物从 8.05 GB 涨到 13.78 GB,**几乎翻倍** ——
+这也是 DSv4.1 当初上 int8 容器的原因之一。
+
+**二、原文说"复用 `mp_select.py`,先改拓扑常量",实际是重写。**
+原版读 `route41/route_calib_e*.json`,那是寄生在 vLLM 里的 collector 吐的;
+本路线没有 collector(§C.2),所以输入换成 `--acts` + checkpoint 的 router 权重,
+用和量化时**同一个** `offline_ptq.route()` 现算路由。改动量远超"拓扑常量 ~5 行",
+而且那份 clone 是只读的,所以新写在 `src/mp_select.py`。
+原版那条"读错 route 目录会按错的拓扑悄悄选出一份看起来正常的 keep 列表"的风险
+因此不存在了,换来的新风险是"激活来自错的模型",硬校验改成查 router 形状 /
+激活 dim / 专家数三者一致。
+
+**三、`--keep-hot` 的三类静默失败都挡掉了。**
+专家号越界(keep 列表来自别的拓扑)、某层保留了全部专家(等于那层没量化)、
+值不是整数列表(把 `*_info.json` 当 keep 传)—— 都直接退出。
+**要量化的层不在 keep 里**只警告不拦,但会明说"那一层整层走低位宽",
+这是原版 `mp_select.py` 列为"缺层"自检的那一条。
+另外保留的专家**不记 SNR** —— 未量化矩阵的 SNR 是 +inf,混进统计会把 p50 推到无意义。
 
 **要量的一个变数:** Qwen3.6 的激活比 3.1% 比 DSv4.1 的 1.6% 更分散,
 热冷差距可能没那么悬殊,回退的收益需要实测,不要照搬 DSv4.1 的 +17 点。
@@ -482,7 +525,6 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 | `core.py:12` | `N_BITS` 接 `UNISVQ_NBITS` | 1 |
 | `qwen3_5/config_registry.py` | 加 35B-A3B + LoRA 的 trainer 配置 | ~40 |
 | `qwen3_5/parallelize.py`(或等价挂点) | 冻结非 adapter 参数 | ~10 |
-| `mp_select.py` | 拓扑常量改成 256 专家 / 40 层 | ~5 |
 | `gen_trace.py` | 角色标记换 `apply_chat_template` + 报告实际用了哪种 | ~20 |
 
 ### 新写
@@ -493,6 +535,7 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 | `offline_ptq.py` | 按层串行 Hessian + 量化 + 写分片 | ~200 |
 | ~~`write_dequant_ckpt.py`~~ | **不写了**,`offline_ptq.py` 直接出 HF 目录;换成 `verify/recheck_ptq_shard.py` 抽查 | ~40 |
 | `merge_lora.py` | 合并 adapter → bf16 checkpoint | ~60 |
+| `mp_select.py` | 按路由计数挑热专家 + 位宽账。**不是改原版**,输入换成 `--acts` + router 权重,见阶段 4 的修正 | ~250 |
 
 **新代码合计约 400 行**(含脚手架;不含脚手架约 320)。
 

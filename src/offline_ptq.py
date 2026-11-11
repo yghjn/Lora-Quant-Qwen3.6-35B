@@ -12,6 +12,11 @@
     # 只算 Hessian 存盘(给复用 / 调参)
     python -I src/offline_ptq.py hessian --in <ckpt> --acts acts/ --out hess/ --layers 20
 
+    # 混合精度回退(工单 §4.2):先用 mp_select.py 挑热专家,再量化时跳过它们
+    python -I src/mp_select.py --in <ckpt> --acts acts/ --out keep_hot26.json
+    python -I src/offline_ptq.py run --in <ckpt> --out <dst> --bits 2 \
+        --acts acts/ --keep-hot keep_hot26.json
+
 ----
 
 **边界划在哪里,以及为什么。**
@@ -256,6 +261,69 @@ def expert_hessians(
     return H13, H2, ntok
 
 
+# ---------------------------------------------------------------- 混合精度
+def load_keep_hot(path: str, e_n: int, layers: list[int]) -> dict[int, set[int]]:
+    """读 `mp_select.py` 产出的 keep json:`{"<层号>": [专家号, ...]}`。
+
+    工单 §4.2。被列进来的专家**不量化**,原权重直通,所以它们保持 bf16 ——
+    平均位宽因此是 `NB + (16 - NB) * K / E`,不是 DSv4.1 那个 int8 容器的
+    `NB + (8 - NB) * K / E`。两者差 0.8 bit,见 `mp_select.py` 的位宽账。
+
+    三类静默失败,这里全部挡掉:
+      * 专家号 >= E:keep 列表来自别的拓扑,会保错专家。
+      * 要量化的层不在 keep 里:那一层**整层**走低位宽而不自知
+        —— 原版 `mp_select.py` 把这一条列为"缺层"自检,照搬。
+      * 某层保留了全部专家:等于那层没量化,但产物看着正常。
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"读不了 keep json: {path}", str(exc))
+    if not isinstance(raw, dict) or not raw:
+        die(f"{path} 不是 {{层号: [专家号]}} 的非空字典", "用 src/mp_select.py 生成。")
+
+    keep: dict[int, set[int]] = {}
+    for k, v in raw.items():
+        try:
+            ln = int(k)
+        except (TypeError, ValueError):
+            die(f"{path} 的键 {k!r} 不是层号", "格式是 {\"20\": [1, 5, ...]};info 文件请另存。")
+        if not isinstance(v, list) or any(not isinstance(e, int) for e in v):
+            die(f"{path} 第 {ln} 层的值不是整数列表")
+        bad = [e for e in v if not 0 <= e < e_n]
+        if bad:
+            die(f"{path} 第 {ln} 层有越界专家号 {bad[:5]}(E={e_n})",
+                "这份 keep 列表来自别的拓扑 —— 继续下去会保错专家。")
+        if len(set(v)) == e_n:
+            die(f"{path} 第 {ln} 层保留了全部 {e_n} 个专家", "那层等于没量化。")
+        keep[ln] = set(v)
+
+    miss = [ln for ln in layers if ln not in keep]
+    if miss:
+        print(f"\n!! keep json 里没有这些要量化的层:{miss}")
+        print(f"   它们会**整层**走低位宽。如果是有意的就忽略,否则先补全 "
+              f"{os.path.basename(path)}。")
+    extra = sorted(set(keep) - set(layers))
+    if extra:
+        print(f"   (keep json 里有 {len(extra)} 层本次不量化,已忽略:{extra[:8]})")
+    return keep
+
+
+def avg_bits_report(bits: int, keep: dict[int, set[int]] | None,
+                    layers: list[int], e_n: int) -> dict:
+    """按**本次量化的层**算平均位宽。保留的专家是 bf16 = 16 bit。"""
+    slots = len(layers) * e_n
+    kept = sum(len(keep.get(ln, ())) for ln in layers) if keep else 0
+    return {
+        "kept_experts": kept,
+        "expert_slots": slots,
+        "kept_ratio": round(kept / slots, 6) if slots else 0.0,
+        "keep_bits": 16,
+        "avg_bits": round(bits + (16 - bits) * kept / slots, 4) if slots else float(bits),
+    }
+
+
 def load_acts(acts_dir: str, layer: int, dim: int) -> torch.Tensor:
     path = None
     for fn in os.listdir(acts_dir):
@@ -292,8 +360,13 @@ def quantize_layer(
     bits: int,
     damp: float,
     use_ldlq: bool,
+    keep: set[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
-    """w13 [E,2F,D] / w2 [E,D,F],都是 [out,in]。返回量化后的两个张量 + 每专家记录。"""
+    """w13 [E,2F,D] / w2 [E,D,F],都是 [out,in]。返回量化后的两个张量 + 每专家记录。
+
+    `keep` 里的专家**原权重直通**(工单 §4.2 的混合精度回退),记 `kept: True`
+    且**不记 SNR** —— 未量化矩阵的 SNR 是 +inf,混进统计会把 p50 推到无意义。
+    """
     e_n, two_f, dim = w13.shape
     hidden = two_f // 2
     Hd = core.hadamard(core.HAD_BLOCK)
@@ -304,6 +377,14 @@ def quantize_layer(
 
     for e in range(e_n):
         rec: dict = {"expert": e}
+        if keep and e in keep:
+            out13[e] = w13[e]
+            out2[e] = w2[e]
+            rec["kept"] = True
+            if ntok is not None:
+                rec["ntok"] = int(ntok[e])
+            recs.append(rec)
+            continue
         for tag, W, H, in_n, out_n in (
             ("w13", w13[e], None if H13 is None else H13[e], dim, two_f),
             ("w2", w2[e], None if H2 is None else H2[e], hidden, dim),
@@ -393,6 +474,9 @@ def cmd_run(args) -> int:
         die(f"输出目录非空: {args.out}(拒绝覆盖)")
     os.makedirs(args.out, exist_ok=True)
 
+    keep = load_keep_hot(args.keep_hot, e_n, layers) if args.keep_hot else None
+    bitacct = avg_bits_report(args.bits, keep, layers, e_n)
+
     print("================ 配置 ================")
     print(f"E / dim / hidden   {e_n} / {dim} / {hidden}")
     print(f"朝向               {layout}" + ("  (按形状判出)" if args.layout == "auto" else "  (显式指定)"))
@@ -403,6 +487,17 @@ def cmd_run(args) -> int:
     print(f"阻尼               {args.damp}")
     print(f"LDLQ               {'开' if not args.no_ldlq else '关(退化成逐组码本量化)'}")
     print(f"层                 {len(layers)} 层: {layers if len(layers) <= 8 else str(layers[:8]) + '...'}")
+    if keep:
+        print(f"混合精度回退       {args.keep_hot}")
+        print(f"                   保留 {bitacct['kept_experts']}/{bitacct['expert_slots']} 个专家槽"
+              f"({100 * bitacct['kept_ratio']:.2f}%),保留的是 **bf16**")
+        print(f"平均位宽           {bitacct['avg_bits']:.3f} bit"
+              f"  = {args.bits} + (16-{args.bits})x{bitacct['kept_ratio']:.4f}")
+        print(f"                   同保留比例换成 int8 容器会是 "
+              f"{args.bits + (8 - args.bits) * bitacct['kept_ratio']:.3f} bit —— "
+              f"DSv4.1 的数是后者那个口径,跨路线比较前先对齐(见 mp_select.py 的位宽账)")
+    else:
+        print(f"混合精度回退       无(全部专家都量化到 {args.bits} bit)")
     if args.gate_up_order == "gate_first" and use_hessian:
         print(
             "\n注意:gate/up 顺序弄反会让 H2 整个错掉,而 SNR 看不出来"
@@ -425,6 +520,8 @@ def cmd_run(args) -> int:
         "moe_hidden_dim": hidden,
         "sign_seed_scheme": SIGN_SEED_SCHEME,
         "scope": "routed experts only",
+        "keep_hot": os.path.abspath(args.keep_hot) if args.keep_hot else None,
+        "mixed_precision": bitacct,
         "layers": {},
     }
 
@@ -451,24 +548,36 @@ def cmd_run(args) -> int:
         else:
             print(f"\n[层 {ln}] H=identity")
 
+        keep_ln = keep.get(ln) if keep else None
         q13, q2, recs = quantize_layer(
-            w13, w2, H13, H2, ntok, ln, args.bits, args.damp, not args.no_ldlq
+            w13, w2, H13, H2, ntok, ln, args.bits, args.damp, not args.no_ldlq, keep_ln
         )
         patched.setdefault(d["gate_up"][0], {})[d["gate_up"][1]] = from_out_in(q13, layout)
         patched.setdefault(d["down"][0], {})[d["down"][1]] = from_out_in(q2, layout)
 
-        s13 = sorted(r["w13_snr"] for r in recs)
-        s2 = sorted(r["w2_snr"] for r in recs)
+        # 保留的专家没有 SNR(未量化,+inf),统计只看真被量化的那些。
+        s13 = sorted(r["w13_snr"] for r in recs if "w13_snr" in r)
+        s2 = sorted(r["w2_snr"] for r in recs if "w2_snr" in r)
+        n_kept = sum(1 for r in recs if r.get("kept"))
+        if not s13:
+            die(f"第 {ln} 层一个专家都没量化", "keep 列表覆盖了整层?")
         deg = sum(1 for r in recs if r.get("w13_degraded") or r.get("w2_degraded"))
         print(
             f"         w13 SNR min {s13[0]:.2f} / p50 {s13[len(s13) // 2]:.2f} / max {s13[-1]:.2f} dB"
             f"   w2 SNR min {s2[0]:.2f} / p50 {s2[len(s2) // 2]:.2f} / max {s2[-1]:.2f} dB"
+            + (f"   保留 {n_kept}" if n_kept else "")
             + (f"   DEGRADED {deg}" if deg else "")
         )
+        if n_kept and ntok is not None:
+            kept_tok = sum(int(ntok[e]) for e in keep_ln)
+            tot_tok = max(int(ntok.sum()), 1)
+            print(f"         保留的 {n_kept} 个专家承载本层校准 token 的 "
+                  f"{100.0 * kept_tok / tot_tok:.1f}%")
         manifest["layers"][str(ln)] = {
             "w13_snr": {"min": s13[0], "p50": s13[len(s13) // 2], "max": s13[-1]},
             "w2_snr": {"min": s2[0], "p50": s2[len(s2) // 2], "max": s2[-1]},
             "degraded": deg,
+            "kept": sorted(keep_ln) if keep_ln else [],
             "experts": recs if args.full_manifest else None,
         }
 
@@ -493,6 +602,10 @@ def cmd_run(args) -> int:
         meta["ptq_bits"] = str(args.bits)
         meta["ptq_layout"] = layout
         meta["ptq_gate_up_order"] = args.gate_up_order
+        # 平均位宽进 metadata:评测端拿到分片就能知道这是几 bit 的产物,
+        # 不必回头去翻 manifest。TAG 也该照这个数起(工单 §4.2)。
+        meta["ptq_avg_bits"] = str(bitacct["avg_bits"])
+        meta["ptq_kept_experts"] = str(bitacct["kept_experts"])
         meta.setdefault("format", "pt")
         save_file(tensors, dp, metadata=meta)
         print(f"  [quant] {fn}  ({len(patched[fn])} 个张量被替换)")
@@ -515,6 +628,9 @@ def cmd_run(args) -> int:
     print(f"w13 p50 SNR  {min(all13):.2f} .. {max(all13):.2f} dB")
     print(f"w2  p50 SNR  {min(all2):.2f} .. {max(all2):.2f} dB")
     print(f"DEGRADED     {tot_deg} 个矩阵" + ("  <- 工单 §2.4 要求全量时为 0" if tot_deg else ""))
+    if keep:
+        print(f"平均位宽     {bitacct['avg_bits']:.3f} bit"
+              f"(保留 {bitacct['kept_experts']}/{bitacct['expert_slots']} 个专家槽为 bf16)")
     print(f"manifest ->  {os.path.join(args.out, 'ptq_manifest.json')}")
     if len(layers) < len(idx):
         print(f"\n这是 {len(layers)}/{len(idx)} 层的部分产物 —— 其余层仍是原权重,**不能用来出交付数**。")
@@ -583,6 +699,11 @@ def main() -> int:
     pr.add_argument("--hessian", default="acts", help="'identity' 表示 H=I(无校准);否则用 --acts")
     pr.add_argument("--damp", type=float, default=0.01, help="Tikhonov 阻尼系数(相对 mean diag)")
     pr.add_argument("--no-ldlq", action="store_true", help="关掉 LDLQ,只留 RHT + 码本")
+    pr.add_argument(
+        "--keep-hot",
+        help="混合精度回退(工单 §4.2):mp_select.py 产出的 keep json,"
+             "列进来的专家不量化、保持 bf16。平均位宽记进 manifest 和分片 metadata。",
+    )
     pr.add_argument("--full-manifest", action="store_true", help="manifest 里记每个专家的 SNR/proxy")
     pr.set_defaults(func=cmd_run)
 
