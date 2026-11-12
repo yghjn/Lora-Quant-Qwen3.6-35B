@@ -21,6 +21,7 @@ TT_DIR="${TT_DIR:-$HOME/src/torchtitan-npu}"
 PIP_IDX="${PIP_IDX:-}"   # 留空用 pip 自己的默认源
 
 # 2026-11-05 复查:两个 wheel 都仍可下载。**不要只升一个**,见 GATE 2。
+TORCH_WHL_USER="${TORCH_WHL:-}"   # 非空 = 用户自己换了 wheel,版本/架构检查放行
 TORCH_WHL="${TORCH_WHL:-https://download.pytorch.org/whl/nightly/cpu/torch-2.14.0.dev20260719%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl}"
 TORCH_NPU_VER="${TORCH_NPU_VER:-2.14.0.dev20260808}"
 TORCH_NPU_IDX="${TORCH_NPU_IDX:-https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html}"
@@ -49,10 +50,37 @@ cpu_only() { env ASCEND_RT_VISIBLE_DEVICES= "$@"; }
 say "环境"
 echo "解释器: $P"
 "$P" -V
-case "$("$P" -c 'import sys;print("%d.%d"%sys.version_info[:2])')" in
-    3.12) ;;
-    *) echo "   注意:下面的 wheel 是 cp312 的,当前不是 3.12,装不上要换 TORCH_WHL" ;;
-esac
+# Python 版本不对就在这里停,不要往下走。以前这里只打一行"注意"然后继续,
+# 结果是 CANN 段、pip 自举都跑完了才死在 GATE 1,而且 GATE 1 的报错说的是
+# "直链可能已被回收" —— 和真因(解释器 tag 不符)毫无关系。
+PYV="$("$P" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+PYMINOR="${PYV#*.}"
+ENV_NAME="$(basename "${CONDA_PREFIX:-${TRAIN_ENV:-}}")"
+if [ "${PYV%%.*}" != "3" ] || [ "$PYMINOR" -lt 12 ]; then
+    WRONG_ENV=""
+    case "$ENV_NAME" in
+        *quant*) WRONG_ENV="当前环境 '$ENV_NAME' 是量化线的(Python 3.10,给 env/2_pip_quant.sh 用)。" ;;
+    esac
+    die "Python $PYV 装不了训练线,需要 3.12" \
+        ${WRONG_ENV:+"$WRONG_ENV"} \
+        "torchtitan-npu 的 requires-python 是 >=3.12,torch / torch_npu 的 wheel 也只有 cp312。" \
+        "换 TORCH_WHL 救不了:就算 torch 装上,torchtitan_npu 也装不进 <3.12 的解释器。" \
+        "" \
+        "训练线用单独的环境 lqq-train:" \
+        "    conda env list                      # 看 lqq-train 在不在" \
+        "    bash env/1_conda_envs.sh            # 不在就建(已有的环境会跳过,不会动 lqq-quant)" \
+        "    conda activate lqq-train && bash env/2_pip_train.sh"
+fi
+if [ "$PYV" != "3.12" ] && [ -z "$TORCH_WHL_USER" ]; then
+    die "Python $PYV 不是 3.12,默认的 torch wheel 是 cp312 的,装不上" \
+        "要么用 3.12 的环境(推荐,这是核对过的组合)," \
+        "要么 TORCH_WHL=<对应 cp 版本的 nightly 直链> 重跑,并自己确认 torch_npu 有同 tag 的 wheel。"
+fi
+ARCH="$(uname -m)"
+if [ "$ARCH" != "aarch64" ] && [ -z "$TORCH_WHL_USER" ]; then
+    die "本机架构是 $ARCH,默认的 torch wheel 是 aarch64 的" \
+        "Ascend 的训练环境都是 aarch64。确认你登的是带 NPU 的那台机器。"
+fi
 
 # ---------------------------------------------------------------- CANN
 say "0. CANN 环境"
@@ -65,18 +93,44 @@ done
 [ -n "$SET_ENV" ] || die "找不到 CANN 的 set_env.sh" \
     "找过 ascend-toolkit/set_env.sh 和 cann/set_env.sh" \
     "装在别处就 export ASCEND_SET_ENV_PATH=<路径> 再跑"
+# set_env.sh 不是按 `set -u` 写的:调用方没设过 PYTHONPATH / CMAKE_PREFIX_PATH
+# 时它会报两行 "unbound variable"。在 CANN 8.5.1 上实测那两行出在命令替换的
+# 子 shell 里,最终环境和不开 -u 时一样,只是噪音;但别的版本的 set_env.sh
+# 怎么写的没看过,所以 source 期间关掉 -u,不赌它。
+set +u
 # shellcheck disable=SC1090
 source "$SET_ENV"
+set -u
 echo "已 source $SET_ENV"
 echo "toolkit: $(readlink -f /usr/local/Ascend/ascend-toolkit/latest 2>/dev/null || echo '<未知>')"
-LIB="$(find /usr/local/Ascend -name libopapi.so 2>/dev/null | head -1)"
-if [ -n "$LIB" ]; then
-    echo "libopapi: $LIB"
-    echo "  符号总数: $(nm -D "$LIB" 2>/dev/null | grep -c ' T ')   (参考 9.0.1=8109 / 9.1.0=8835)"
-    for s in aclnnMoeDistributeDispatch aclnnFlashAttentionScoreV3 aclnnFlashAttentionVarLenScoreV3; do
-        n="$(nm -D "$LIB" 2>/dev/null | grep -c "$s")"
-        printf '  %-40s %s%s\n' "$s" "$n" "$([ "$n" -eq 0 ] && echo '  <- Qwen 路径要用,为 0 要注意')"
+# 把找得到的 libopapi.so 全列出来(按真实路径去重)。以前只取 find 的第一个,
+# 机器上并存几套 CANN 时看到的未必是 set_env.sh 实际指向的那套。
+# 搜索范围:/usr/local/Ascend,加上 set_env.sh 所在的那棵树(CANN 装在别处时)。
+CANN_ROOTS="/usr/local/Ascend"
+case "$SET_ENV" in /usr/local/Ascend/*) ;; *) CANN_ROOTS="$CANN_ROOTS $(dirname "$SET_ENV")" ;; esac
+# shellcheck disable=SC2086
+LIBS="$(find $CANN_ROOTS -name libopapi.so 2>/dev/null | xargs -r -n1 readlink -f | sort -u)"
+OPAPI_MAX=0
+if [ -n "$LIBS" ]; then
+    echo "libopapi.so(参考符号总数:8.5.1=3511 / 9.0.1=8109 / 9.1.0=8835):"
+    for LIB in $LIBS; do
+        tot="$(nm -D "$LIB" 2>/dev/null | grep -c ' T ')"
+        [ "$tot" -gt "$OPAPI_MAX" ] && OPAPI_MAX="$tot"
+        echo "  $LIB"
+        echo "    符号总数: $tot"
+        for s in aclnnMoeDistributeDispatch aclnnFlashAttentionScoreV3 aclnnFlashAttentionVarLenScoreV3; do
+            n="$(nm -D "$LIB" 2>/dev/null | grep -c "$s")"
+            printf '    %-40s %s%s\n' "$s" "$n" "$([ "$n" -eq 0 ] && echo '  <- Qwen 路径要用,为 0 要注意')"
+        done
     done
+    if [ "$OPAPI_MAX" -lt 8000 ]; then
+        echo
+        echo "  !! 这套 CANN 是 8.x 量级的(符号数不到 9.0.1 的一半)。"
+        echo "     核对过能跑通 torchtitan-npu 训练的是 CANN 9.1.0。8.x 上 torch_npu"
+        echo "     dev20260808 能不能 import、算子全不全,本项目没验过。"
+        echo "     这不拦安装 —— 脚本继续,GATE 2(import torch_npu)会给出第一个实测答案。"
+        echo "     机器上若另有 9.x:export ASCEND_SET_ENV_PATH=<那套的 set_env.sh> 再重跑。"
+    fi
 else
     echo "没找到 libopapi.so —— 它在 ops 包里(A3 芯片叫 Ascend-cann-A3-ops),不在 toolkit 里"
 fi
@@ -89,7 +143,11 @@ say "1. torch  (GATE 1)"
 echo "wheel: $TORCH_WHL"
 "$P" -m pip install -q --no-deps "$TORCH_WHL" \
     || die "torch 下载/安装失败" \
-           "直链可能已被回收。去 https://download.pytorch.org/whl/nightly/cpu/torch/" \
+           "先看上面 pip 的原话:" \
+           "  'is not a supported wheel on this platform' = wheel 的 tag 和解释器/架构不符," \
+           "     不是链接问题(用了自定义 TORCH_WHL 时检查它的 cpXY 和 aarch64)。" \
+           "  404 / 连接超时 = 直链可能已被回收,或 proxy 状态不对。" \
+           "直链失效时去 https://download.pytorch.org/whl/nightly/cpu/torch/" \
            "找最接近 2026-07-19 的 aarch64 cp312 nightly,用 TORCH_WHL=<url> 覆盖。" \
            "**换日期有风险**,见 GATE 2 的说明。"
 pip_install -q filelock fsspec jinja2 networkx sympy typing-extensions

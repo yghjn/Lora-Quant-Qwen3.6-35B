@@ -417,6 +417,11 @@ bash env/1_conda_envs.sh
 conda activate lqq-train
 ```
 
+**是 `lqq-train`,不是 `lqq-quant`。** 两个名字像,但 `lqq-quant` 是量化线的环境
+(Python 3.10),训练线的包装不进去。激活错了 `env/2_pip_train.sh` 会在第一步
+停下并指路,不会再跑到 GATE 1 才报一句看不出原因的
+`is not a supported wheel on this platform`。
+
 Python 必须 >= 3.12。在 3.9 上 import 会报
 `dataclass() got an unexpected keyword argument 'kw_only'` —— 那是 Python 版本
 (`kw_only` 是 3.10 才有的),不是 torchtitan 坏了。
@@ -534,6 +539,7 @@ conda activate lqq-train && bash env/2_pip_train.sh
 
 | 闸门 | 验什么 | 典型失败 |
 |---|---|---|
+| 前置 | Python 是 3.12、架构是 aarch64 | 在 `lqq-quant`(3.10)里跑了本脚本。不过就直接停,什么都不装 |
 | 1 | torch 装上且能 import | 直链被回收 |
 | 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
 | 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule) |
@@ -567,4 +573,7 @@ conda activate lqq-train && bash env/2_pip_train.sh
 * **环境不要建在 `/dev/shm`。** 上一份训练环境就建在那里,随重启整个消失。
 * **CANN 版本决定融合算子可用性。** 9.0.1 缺 `aclnnMhcPost` / `aclnnSparseFlashMla`
   等符号,9.1.0 才有;而且 `libopapi.so` 在 ops 包里,只装 toolkit 验不出来。
+  `env/2_pip_train.sh` 的第 0 段会列出找到的每个 `libopapi.so` 和导出符号数,
+  参照是 8.5.1=3511 / 9.0.1=8109 / 9.1.0=8835;不到 8000 会打警告。
+  **8.x 上能不能跑通训练线没验过** —— 核对过的只有 9.1.0。
 * **产物不要放 tmpfs。** 2bit 产物 7.5 GiB、3bit 11.3 GiB,放持久盘。
