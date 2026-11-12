@@ -135,6 +135,48 @@ else
     echo "没找到 libopapi.so —— 它在 ops 包里(A3 芯片叫 Ascend-cann-A3-ops),不在 toolkit 里"
 fi
 
+# ---------------------------------------------------------------- 索引
+say "pip 索引取得到包吗"
+# 为什么单独探一次:索引不通时,下面的"pip 自举"**不会报错** —— pip / setuptools /
+# wheel 本来就装着,-U 查不到新版本就算"已满足"。GATE 1 的 torch 走的是
+# download.pytorch.org 直链,也不经索引。于是索引问题会一路滑到 torch 的运行依赖
+# 那一行才露头,表现成 "No matching distribution found for filelock" 外加一个
+# 看着像 torch 坏了的 "No module named 'typing_extensions'"。
+# 这里拿一个小包(filelock,约 20 KB)真下载一次,不装进环境。
+PROBE_DIR="$(mktemp -d)"
+PROBE_LOG="$PROBE_DIR/pip.log"
+PROBE_ARGS=(-m pip download -v --no-deps --no-cache-dir --retries 1 --timeout 20 -d "$PROBE_DIR" filelock)
+[ -n "$PIP_IDX" ] && PROBE_ARGS+=(-i "$PIP_IDX")
+mask() { sed -E 's#//[^/@[:space:]]*@#//<凭据已隐去>@#g'; }
+if "$P" "${PROBE_ARGS[@]}" >"$PROBE_LOG" 2>&1; then
+    echo "通。用的索引:$(grep -m1 -oE 'https?://[^ ]*/filelock/' "$PROBE_LOG" | mask || true)"
+    rm -rf "$PROBE_DIR"
+else
+    echo "pip 的原话(筛过,凭据已隐去):"
+    grep -E 'Looking in indexes|^ *\* http|HTTP error|Could not fetch|Retrying|ProxyError|SSLError|[Cc]onnection|name resolution|Skipping link|^ERROR' "$PROBE_LOG" \
+        | mask | cut -c1-240 | head -14 | sed 's/^/    /'
+    echo "pip config list:"
+    CFG="$("$P" -m pip config list 2>/dev/null | mask)"
+    printf '%s\n' "${CFG:-(空 —— 没有 pip.conf,用的是 pip 默认的 pypi.org)}" | sed 's/^/    /'
+    echo "已设置的相关环境变量(只列名字,不打值):"
+    VARS="$(env | grep -iE '^(pip_[a-z_]*|[a-z_]*proxy)=' | cut -d= -f1 | tr '\n' ' ')"
+    echo "    ${VARS:-(无)}"
+    rm -rf "$PROBE_DIR"
+    die "pip 索引取不到包(用 filelock 探的),后面所有 pip 步骤都会失败" \
+        "对照上面 pip 的原话:" \
+        "  HTTP error 403/404/407,或没有任何网络报错只说 versions: none" \
+        "      = 连上了,但那个地址给的不是包列表(镜像没同步 / 被网关或代理拦了)" \
+        "  Retrying / Connection / name resolution" \
+        "      = 根本连不上" \
+        "两条修法,选一条:" \
+        "  a) 换一个本机能通的镜像重跑,例如" \
+        "       PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple bash env/2_pip_train.sh" \
+        "       PIP_IDX=https://repo.huaweicloud.com/repository/pypi/simple bash env/2_pip_train.sh" \
+        "  b) proxy 状态不对。本脚本不碰 proxy,由你开/关后重跑 ——" \
+        "     这台机器上次 pip 装成功(比如装 lqq-quant)时是什么状态,就切回那个状态。" \
+        "注意:torch 的 wheel 是直链,它下得动不代表索引通。"
+fi
+
 say "pip 自举"
 pip_install -q -U pip setuptools wheel || die "pip 自举失败" "网络问题请确认 proxy 已按本机要求关掉"
 
@@ -150,7 +192,12 @@ echo "wheel: $TORCH_WHL"
            "直链失效时去 https://download.pytorch.org/whl/nightly/cpu/torch/" \
            "找最接近 2026-07-19 的 aarch64 cp312 nightly,用 TORCH_WHL=<url> 覆盖。" \
            "**换日期有风险**,见 GATE 2 的说明。"
-pip_install -q filelock fsspec jinja2 networkx sympy typing-extensions
+# torch 是 --no-deps 装的,它 import 时要的这几个纯 Python 包得单独补。
+# 以前这行没有 `|| die`:装失败了脚本照样往下走,最后报的是 "import torch 失败"。
+pip_install -q filelock fsspec jinja2 networkx sympy typing-extensions \
+    || die "torch 的运行依赖安装失败(torch 本体已装上)" \
+           "这几个都是 PyPI 上的普通包,装不上就是索引问题,不是 torch 的问题。" \
+           "换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
 "$P" -c 'import torch; print("torch", torch.__version__)' || die "import torch 失败"
 
 # ---------------------------------------------------------------- GATE 2

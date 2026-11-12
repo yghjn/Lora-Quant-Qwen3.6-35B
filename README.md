@@ -540,6 +540,7 @@ conda activate lqq-train && bash env/2_pip_train.sh
 | 闸门 | 验什么 | 典型失败 |
 |---|---|---|
 | 前置 | Python 是 3.12、架构是 aarch64 | 在 `lqq-quant`(3.10)里跑了本脚本。不过就直接停,什么都不装 |
+| 前置 | pip 索引取得到包(真下载一次 `filelock`,不装) | 镜像/代理状态不对。不探的话会滑到闸门 1 才露头,见下面"索引不通长什么样" |
 | 1 | torch 装上且能 import | 直链被回收 |
 | 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
 | 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule) |
@@ -547,6 +548,17 @@ conda activate lqq-train && bash env/2_pip_train.sh
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
 真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令,留给卡空闲时跑。
+
+**索引不通长什么样。** 旧版脚本上的表现是闸门 1 报
+`No matching distribution found for filelock`,紧接着
+`No module named 'typing_extensions'` 和 `import torch 失败` —— 看着像 torch 坏了,
+其实 torch 本体已经装上,缺的是它 import 时要的几个普通 PyPI 包。成因有三层:
+torch 的 wheel 是 `download.pytorch.org` 的直链,不经索引,所以它下得动;
+`pip install -U pip setuptools wheel` 在索引不通时也不报错(本来就装着,查不到
+新版就算已满足);而补依赖那一行以前没有失败检查。现在脚本在装任何东西之前先探索引,
+不通就停下并打出 pip 的原话、`pip config list` 和已设置的 proxy / `PIP_*` 变量名。
+修法是换镜像(`PIP_IDX=<镜像地址> bash env/2_pip_train.sh`)或把 proxy 切回
+上次 pip 装成功时的状态。
 
 版本组合(2026-11-05 复查,两个 wheel 都仍可下载):
 
