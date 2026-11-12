@@ -118,7 +118,7 @@ verify/
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,22 项,纯 CPU,参考值用 einsum 独立算
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
-  probe_lora_tree.py       工单 0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境)
+  probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
 ```
 
 `src/unisvq_core.py` 是内部 UniSVQ 参考实现的 vendoring 副本,相对原版只改了
@@ -280,6 +280,8 @@ Hessian 感知量化干的就是这件事:把误差挪到激活不激发的方�
    SNR min 10.70 / p50 11.12 / max 11.68 dB。
 2. **不需要卡**:建训练环境(`env/2_pip_train.sh`,proxy 要关),
    跑 `verify/probe_lora_tree.py`(§0.1)。**这是整条 LoRA 线的闸门。**
+   完整流程和 torchtitan 的来历见"§0.1 闸门怎么跑" —— upstream torchtitan
+   要单独 clone 进 `third_party/`,它不是 submodule。
 3. **不需要卡**:`prepare_corpus.py --tokenizer <tokenizer目录> --synthetic 64`
    先把 chat template 验死,顺手产出冒烟语料。
 4. 需要一张卡:`qwen36_35b_a3b_lora_smoke`(20 步)。看三件事 ——
@@ -373,6 +375,147 @@ python src/merge_lora.py --base <假量化ckpt> --adapter <adapter输出目录> 
 参照数因此全部不可用。合并后的 `merge_info.json` 和分片 metadata 里会
 记下实际用的 scaling,评测端照它核对。
 
+## §0.1 闸门怎么跑(从零开始的完整流程)
+
+`verify/probe_lora_tree.py` 验的是:DSv4 的分组专家 LoRA 工厂能不能挂上
+Qwen3.5/3.6-35B-A3B 的配置树。**不需要权重、不需要卡**,但需要 torchtitan
+能 import —— 而 torchtitan 不是一个 `pip install` 就有的东西,见下一节。
+
+### 第 0 步:先搞清 torchtitan 从哪来
+
+这个项目依赖**两个**仓库,它们是嵌套关系但**要分别拿、分别装**:
+
+| | 包名 | 来源 | 核对过的版本 | Python |
+|---|---|---|---|---|
+| Ascend 插件 | `torchtitan_npu` | `https://gitcode.com/cann/torchtitan-npu.git` | `3f9f99a`(0.1.0) | **>= 3.12** |
+| upstream | `torchtitan` | `https://gitcode.com/GitHub_Trending/to/torchtitan.git` | `086bf6c16`(0.3.0) | >= 3.11 |
+
+upstream 要放在插件仓库的 `third_party/torchtitan/` 下。**三个事实合在一起,
+就是"常规方法装不上"的全部原因:**
+
+1. `third_party/` 被 torchtitan-npu 自己的 `.gitignore` 挡掉(第 115 行 `/third_party/`),
+   所以 **clone 下来这个目录是空的**。
+2. 它**不是 submodule** —— `.gitmodules` 里只有 `third_party/agent-skills/KPBot` 一条。
+   `git submodule update --init` 退出码 0,但拿不到 torchtitan。
+3. `pip install -e <torchtitan-npu>` **只装 `torchtitan_npu`**:它的 `pyproject.toml`
+   里 `packages.find` 写着 `exclude = ["third_party*"]`。`dependencies` 里虽然列了
+   `torchtitan`,但 PyPI 上那个不是这里要的版本,而且本流程一律 `--no-deps`。
+
+所以只装了插件的环境里,`import torchtitan_npu` 能过,`import torchtitan` 报
+`No module named 'torchtitan'` —— 看着像漏装一个包,实际是少 clone 一个仓库。
+
+另外 torch 是钉死的 nightly:`torch==2.14.0.dev20260719`、`torch_npu==2.14.0.dev20260808`
+(`torchtitan-npu/requirements.txt`),见下面"训练环境安装"的版本表。
+
+### 第 1 步:建环境(Python 3.12)
+
+```bash
+bash env/1_conda_envs.sh
+```
+
+```bash
+conda activate lqq-train
+```
+
+Python 必须 >= 3.12。在 3.9 上 import 会报
+`dataclass() got an unexpected keyword argument 'kw_only'` —— 那是 Python 版本
+(`kw_only` 是 3.10 才有的),不是 torchtitan 坏了。
+
+### 第 2 步:装包。两条路选一条
+
+**A. 用脚本(推荐)。** 它会 clone 两个仓库、钉 commit、`--no-deps` 装两个包,
+然后依次过四道闸门,第 4 道就是本脚本:
+
+```bash
+bash env/2_pip_train.sh
+```
+
+torchtitan-npu 默认放 `~/src/torchtitan-npu`,要换位置就 `TT_DIR=<目录> bash env/2_pip_train.sh`。
+
+**B. 手动。** 机器上已经有一份 torchtitan-npu、或者不想跑整个脚本时:
+
+```bash
+git clone https://gitcode.com/cann/torchtitan-npu.git ~/src/torchtitan-npu
+```
+
+```bash
+git clone https://gitcode.com/GitHub_Trending/to/torchtitan.git ~/src/torchtitan-npu/third_party/torchtitan
+```
+
+```bash
+git -C ~/src/torchtitan-npu/third_party/torchtitan checkout 086bf6c16
+```
+
+```bash
+pip install --no-deps -e ~/src/torchtitan-npu/third_party/torchtitan
+```
+
+```bash
+pip install --no-deps -e ~/src/torchtitan-npu
+```
+
+**`--no-deps` 不能省。** torchtitan 钉着 torch nightly,让 pip 自己去解依赖,
+它会把你装好的 torch / torch_npu 换掉,而这两个必须成对(见下面的版本表)。
+torch、torch_npu 和其余依赖的装法照 `env/2_pip_train.sh` 第 1–3 段。
+
+### 第 3 步:跑
+
+```bash
+python3 verify/probe_lora_tree.py
+```
+
+两个包都装进当前环境了就这样直接跑。**没装、只想指一个现成的目录**也行 ——
+脚本会自己把 `<TT_ROOT>` 和 `<TT_ROOT>/third_party/torchtitan` 接上 `sys.path`,
+不用手配 `PYTHONPATH`:
+
+```bash
+TT_ROOT=<torchtitan-npu 目录> python3 verify/probe_lora_tree.py
+```
+
+可调的环境变量:`TT_FLAVOR`(默认 `35B-A3B`)、`TT_RANK`(16)、`TT_ALPHA`(32)。
+**不要用 `python -I` 跑它** —— `-I` 会忽略 `PYTHONPATH` 并去掉 user site,
+包如果是 `pip install --user` 装的就直接找不到。
+
+### 第 4 步:读结果
+
+开头三行先告诉你它用的是哪套东西,对不上就不用往下看了:
+
+```
+torchtitan root: /home/.../torchtitan-npu
+Python: 3.12.x
+torchtitan:     /home/.../third_party/torchtitan/torchtitan/__init__.py
+```
+
+通过的样子是"判据"段三条全 `OK`:
+
+| 判据 | 含义 |
+|---|---|
+| 分组专家被 LoRA 覆盖 | 转换后 `routed_experts.inner_experts` 的 Config 类型变成了 GroupedLoRA* |
+| 命中数 == n_layers | 40 层每层都挂上了(`grouped=40`) |
+| dense 命中为 0 | `target_modules=()` 生效,LoRA 只加在路由专家上 |
+
+外加一行 adapter 参数量,应与 `E × r × (2·dim + 3·moe_inter)` 的解析值一致
+(rank16 全模型 0.92 G 参数)。
+
+失败分两种,**含义完全不同**:
+
+| 现象 | 性质 | 怎么办 |
+|---|---|---|
+| 退出码 2,`!! 失败于 [import ...]` | **环境问题,不是结论** | 脚本会打出诊断:Python 版本 / third_party 是空的 / 路径没找到,并给出修法。修完重跑 |
+| 判据段出现 `X` | **结论为假** | LoRA 工厂挂不上 Qwen 的配置树。阶段 6/7 的排期作废,要改 converter 的树遍历 |
+
+**不要把第一种记成第二种。** import 期炸掉什么都没验到。
+
+常见的 import 失败对照:
+
+| 报错 | 真因 |
+|---|---|
+| `No module named 'torchtitan'` | upstream 没 clone 进 `third_party/`,或没装(第 0 步的三个事实) |
+| `No module named 'torchtitan_npu'` | 插件没装,且没给 `TT_ROOT` |
+| `dataclass() got an unexpected keyword argument 'kw_only'` | Python < 3.10。要 3.12 |
+| `cannot import name 'DataParallelMeshDims' from 'torch.distributed.fsdp'` | torch 太旧,要 2.14 nightly |
+| `Mismatch in kernel C++ signatures` | torch 和 torch_npu 日期不成对 |
+
 ## 训练环境安装
 
 工单阶段 6(LoRA 训练)才需要。量化线用不到。同样分两个阶段,
@@ -393,8 +536,8 @@ conda activate lqq-train && bash env/2_pip_train.sh
 |---|---|---|
 | 1 | torch 装上且能 import | 直链被回收 |
 | 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
-| 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`) |
-| 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门 |
+| 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule) |
+| 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑" |
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
 真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令,留给卡空闲时跑。

@@ -57,7 +57,7 @@
 
 ### B.1 模型定义已经存在,不用自己写 **[已验证]**
 
-上游 torchtitan 里有 Qwen3.5-35B-A3B 的完整定义,几何和 Qwen3.6-35B-A3B 一致:
+上游 torchtitan(0.3.0,commit `086bf6c16`;它在 torchtitan-npu 的 `third_party/torchtitan/` 下,是**单独 clone 的仓库,不是 submodule**)里有 Qwen3.5-35B-A3B 的完整定义,几何和 Qwen3.6-35B-A3B 一致:
 
 `third_party/torchtitan/torchtitan/models/qwen3_5/__init__.py:897` 的 `_35b_a3b()`:
 
@@ -279,11 +279,33 @@ DSv4.1:  W_deploy = quant_int8( dequant(W_nbit) + (alpha/rank)·B·A )
 
 | # | 事 | 验收 |
 |---|---|---|
-| 0.1 | 验证 `LoRAConverter` 能在 Qwen3.5-35B-A3B 的配置树上挂住分组专家 LoRA。**不需要权重、不需要卡**,构造配置树即可 | 转换后的配置树里 `routed_experts.inner_experts` 的 config 类型是 `GroupedLoRAExperts.Config`;打印的 LoRA 行形如 `dense=0 grouped=40` |
+| 0.1 | 验证 `LoRAConverter` 能在 Qwen3.5-35B-A3B 的配置树上挂住分组专家 LoRA。**不需要权重、不需要卡**,构造配置树即可。**但需要 Python >= 3.12 且两个仓库都装上**,见下 | 转换后的配置树里 `routed_experts.inner_experts` 的 config 类型是 `GroupedLoRAExperts.Config`;打印的 LoRA 行形如 `dense=0 grouped=40` |
 | 0.2 | 下 Qwen3.6-35B-A3B 权重,逐文件 Sha256 校验 | 校验全对,条数记录在案 |
 | 0.3 | 用真 config 替换 `qwen36/fixtures/qwen36-35b-a3b/config.json` 重跑形状预检 | 退出码 0,"形状预检:全过" |
 | 0.4 | 上游 `qwen3_5` 的 `35B-A3B` flavor 做 5 步训练 dry run,HF 格式初始加载 | `exit=0`,loss 有限且非 NaN,**无** "保持随机初始化" 类告警 |
 | 0.5 | bf16 基线评测(8 卡 vLLM) | 三数据集出数,作为**分母**记录 |
+
+**0.1 的环境前提(2026-11-12 补,原文漏了)。**
+"不需要权重、不需要卡"没错,但它需要 `torchtitan` 和 `torchtitan_npu` 都能 import,
+而这两个**不是一次装上的**:
+
+| 包 | 来源 | 核对过的版本 | Python |
+|---|---|---|---|
+| `torchtitan_npu` | `gitcode.com/cann/torchtitan-npu` | `3f9f99a`(0.1.0) | >= 3.12 |
+| `torchtitan` | `gitcode.com/GitHub_Trending/to/torchtitan` | `086bf6c16`(0.3.0) | >= 3.11 |
+
+upstream 要放在 `torchtitan-npu/third_party/torchtitan/`,而 `third_party/` 被
+torchtitan-npu 自己的 `.gitignore` 挡掉、**且不是 submodule**(`.gitmodules` 只有
+KPBot 一条),`pip install -e` 也把它排除在外。所以 clone + 装插件之后
+`import torchtitan` 仍然报 No module named —— 少的是一个仓库,不是一个包。
+
+`env/2_pip_train.sh` 原先用 `git submodule update --init` 去拉它,退出码 0 但
+什么都没拉到,下一行必然死在"装 torchtitan 失败"上。已改成显式 clone 并钉 commit。
+`verify/probe_lora_tree.py` 现在自己接路径(`TT_ROOT`)、自己查 Python 版本,
+import 失败时把真因和修法打出来。完整流程在 README 的"§0.1 闸门怎么跑"。
+
+**判读:import 期失败(退出码 2)是环境问题,不是 0.1 的结论。**
+只有"判据"段出现 `X` 才说明 LoRA 挂不上。
 
 **0.1 和 0.4 是整条链的闸门**:flavor 加载不了真权重,后面全部排期作废。
 先做它们,不要先写量化器。

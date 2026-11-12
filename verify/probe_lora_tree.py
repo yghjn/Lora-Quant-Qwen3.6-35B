@@ -19,11 +19,31 @@
 
 用法
 ----
-    PYTHONPATH=<repo>:<repo>/third_party/torchtitan python3 probe_lora_tree.py
+    TT_ROOT=<torchtitan-npu 目录> python3 verify/probe_lora_tree.py
+
+装好了的环境(`env/2_pip_train.sh` 跑过)不需要 `TT_ROOT`,直接跑即可。
+本脚本会自己把 `<TT_ROOT>` 和 `<TT_ROOT>/third_party/torchtitan` 接上
+`sys.path`,不需要你手动配 PYTHONPATH。
+
 环境变量:
+    TT_ROOT     torchtitan-npu 的目录。不给就按常见位置猜,猜不到且 import
+                失败时会把原因和两种修法打出来
     TT_FLAVOR   默认 35B-A3B
     TT_RANK     默认 16
     TT_ALPHA    默认 32
+
+两个环境前提(踩过,所以脚本自己查)
+------------------------------------
+* **Python ≥ 3.12。** `torchtitan-npu/pyproject.toml` 写的是
+  `requires-python = ">=3.12"`(upstream torchtitan 是 >=3.11)。
+  在 3.9 上 import 会报 `dataclass() got an unexpected keyword argument
+  'kw_only'` —— 那是 Python 版本,不是 torchtitan 的 bug,`kw_only` 是 3.10 才有的。
+* **upstream torchtitan 要单独装。** `third_party/` 被 torchtitan-npu 自己的
+  `.gitignore` 挡掉(第 115 行 `/third_party/`),而且它**不是 submodule**
+  —— `.gitmodules` 里只有 `third_party/agent-skills/KPBot` 一条。
+  所以 clone 下来 `third_party/` 是空的,`pip install -e <torchtitan-npu>`
+  也只装 `torchtitan_npu`(`packages.find` 里 `exclude = ["third_party*"]`)。
+  `import torchtitan` 报 No module named 就是这个原因。
 """
 
 from __future__ import annotations
@@ -41,18 +61,119 @@ RANK = int(os.environ.get("TT_RANK", "16"))
 ALPHA = float(os.environ.get("TT_ALPHA", "32"))
 
 
+# torchtitan-npu 的两个来源。装的时候要分别装,见模块 docstring。
+TT_NPU_GIT = "https://gitcode.com/cann/torchtitan-npu.git"
+TT_GIT = "https://gitcode.com/GitHub_Trending/to/torchtitan.git"
+TT_PIN = "086bf6c16"  # torchtitan 0.3.0,本项目核对过的那个 commit
+
+
+def _wire_paths() -> str | None:
+    """把 torchtitan-npu 的两个包目录接上 sys.path。返回用的是哪个 root。
+
+    装好了就什么都不做(import 走已安装的包)。给 TT_ROOT 时用它;没给就猜。
+    **不碰 PYTHONPATH** —— 只改本进程的 sys.path,免得影响后面的子进程。
+    """
+    cands = []
+    if os.environ.get("TT_ROOT"):
+        cands.append(os.environ["TT_ROOT"])
+    cands += [
+        os.path.expanduser("~/src/torchtitan-npu"),          # 2_pip_train.sh 的默认 TT_DIR
+        "/home/ma-user/work/l84414662/torchtitan-npu",       # 本机同事的 clone(只读)
+    ]
+    for root in cands:
+        up = os.path.join(root, "third_party", "torchtitan")
+        if os.path.isdir(os.path.join(root, "torchtitan_npu")) and os.path.isdir(
+            os.path.join(up, "torchtitan")
+        ):
+            for p in (root, up):
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            return root
+        # root 对但 third_party 空 —— 这是最常见的那种坏法,单独说
+        if os.path.isdir(os.path.join(root, "torchtitan_npu")) and not os.path.isdir(up):
+            print(f"注意:{root} 在,但 {up} 不存在(third_party 被 gitignore 了)。")
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            return root
+    return None
+
+
+TT_ROOT_USED = _wire_paths()
+
+
+def _env_hints(exc: BaseException | None = None) -> list[str]:
+    """给 import 失败时附的环境诊断。按"最可能是这个"排序。
+
+    `exc` 用来挑该说哪一段:`kw_only` 那种是 Python 版本,和 third_party 无关,
+    把"No module named 的根因"整段也打出来只是噪音。
+    """
+    missing_tt = isinstance(exc, ModuleNotFoundError) and (
+        getattr(exc, "name", "") or ""
+    ).split(".")[0] in ("torchtitan", "torchtitan_npu")
+    out = []
+    if sys.version_info < (3, 12):
+        out += [
+            f"Python 是 {sys.version_info.major}.{sys.version_info.minor},"
+            "torchtitan-npu 要求 >= 3.12(upstream torchtitan >= 3.11)。",
+            "   报 `dataclass() got an unexpected keyword argument 'kw_only'` 就是这个 ——",
+            "   kw_only 是 Python 3.10 才有的,和 torchtitan 无关。",
+            "",
+        ]
+    if TT_ROOT_USED is None:
+        out += [
+            "没找到 torchtitan-npu 的目录,也没在已安装的包里找到 torchtitan。",
+            f"   给路径:TT_ROOT=<torchtitan-npu 目录> python3 {os.path.basename(__file__)}",
+            "",
+        ]
+    if not missing_tt and TT_ROOT_USED is not None:
+        # 路径是通的、错的是别的东西(版本之类)。下面那段就不用说了。
+        out += ["(路径没问题:torchtitan 解析到了。上面那条才是真因。)"]
+        return out
+    out += [
+        "`import torchtitan` 报 No module named 的根因(不是漏装一个包那么简单):",
+        "   upstream torchtitan 在 <root>/third_party/torchtitan,而 third_party 被",
+        "   torchtitan-npu 自己的 .gitignore 挡掉,**且不是 submodule**",
+        "   (.gitmodules 里只有 agent-skills/KPBot)。所以:",
+        "     - clone torchtitan-npu 下来,third_party/ 是空的;",
+        "     - `git submodule update --init` 拿不到它;",
+        "     - `pip install -e <root>` 只装 torchtitan_npu",
+        "       (pyproject 的 packages.find 里 exclude = [\"third_party*\"])。",
+        "",
+        "   两种修法 —— 装:",
+        f"     git clone {TT_GIT} <root>/third_party/torchtitan",
+        f"     git -C <root>/third_party/torchtitan checkout {TT_PIN}",
+        "     pip install --no-deps -e <root>/third_party/torchtitan",
+        "     pip install --no-deps -e <root>",
+        "   (--no-deps 是必须的:torchtitan 钉 torch==2.14.0.dev20260719,",
+        "    让 pip 去解会把环境拆了。)",
+        "",
+        "   或者不装,只给路径:",
+        f"     TT_ROOT=<root> python3 {os.path.basename(__file__)}",
+    ]
+    return out
+
+
 def _fail(stage: str, exc: BaseException) -> None:
     print(f"\n!! 失败于 [{stage}]: {type(exc).__name__}: {exc}")
     traceback.print_exc()
+    print("\n" + "-" * 60)
+    for line in _env_hints(exc):
+        print("   " + line if line else "")
+    print("-" * 60)
     print(
-        "\n判定:本步未通过。注意 import 失败不等于结论为假 —— "
-        "torchtitan 钉 torch==2.14.0.dev20260719,低版本可能在 import 期就炸,\n"
-        "      那属于环境问题,要在正确的 venv 里重跑再下结论。"
+        "\n判定:本步**未通过**,但注意 import 失败不等于结论为假 —— "
+        "上面这些都是环境问题,\n"
+        "      要在装对的 venv 里重跑再下 \"LoRA 挂不上 Qwen 配置树\" 这个结论。"
     )
     sys.exit(2)
 
 
 # ---------------------------------------------------------------- imports
+if TT_ROOT_USED:
+    print(f"torchtitan root: {TT_ROOT_USED}")
+print(f"Python: {sys.version.split()[0]}"
+      + ("" if sys.version_info >= (3, 12) else "   !! torchtitan-npu 要求 >= 3.12"))
+
 try:
     from torchtitan.models.qwen3_5 import model_registry, qwen3_5_configs
 except BaseException as exc:  # noqa: BLE001
@@ -62,6 +183,10 @@ try:
     from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter
 except BaseException as exc:  # noqa: BLE001
     _fail("import DeepSeekV4LoRAConverter", exc)
+
+import torchtitan as _tt  # noqa: E402  —— 只为打出解析到哪个 torchtitan
+
+print(f"torchtitan:     {_tt.__file__}\n")
 
 
 # ------------------------------------------------------------ tree walk

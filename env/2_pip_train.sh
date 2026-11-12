@@ -119,8 +119,30 @@ if [ ! -d "$TT_DIR/.git" ]; then
     mkdir -p "$(dirname "$TT_DIR")"
     git clone https://gitcode.com/cann/torchtitan-npu.git "$TT_DIR" || die "clone torchtitan-npu 失败"
 fi
-git -C "$TT_DIR" submodule update --init --recursive || die "submodule(third_party/torchtitan)拉取失败"
-"$P" -m pip install -q --no-deps -e "$TT_DIR/third_party/torchtitan" || die "装 torchtitan 失败"
+# upstream torchtitan **不是 submodule**:`.gitmodules` 里只有
+# third_party/agent-skills/KPBot 一条,而 third_party/ 本身还被 torchtitan-npu
+# 自己的 .gitignore 挡掉(第 115 行 `/third_party/`)。所以 clone 下来
+# third_party/ 是空的,`git submodule update --init` 退出码 0 但什么都没拉到
+# —— 本脚本之前就是这么写的,结果下一行必然 die 在"装 torchtitan 失败",
+# 而那条消息完全看不出真因。改成显式 clone。
+TT_UP="$TT_DIR/third_party/torchtitan"
+if [ ! -d "$TT_UP/.git" ]; then
+    mkdir -p "$(dirname "$TT_UP")"
+    git clone https://gitcode.com/GitHub_Trending/to/torchtitan.git "$TT_UP" \
+        || die "clone upstream torchtitan 失败" \
+               "它在 $TT_UP,不是 submodule,必须单独 clone。" \
+               "手动做同一件事:git clone https://gitcode.com/GitHub_Trending/to/torchtitan.git $TT_UP"
+fi
+# 钉在本项目核对过的那个 commit(torchtitan 0.3.0)。漂移了再往上走要重新核
+# state_dict_adapter 的键映射和 model_registry 的签名。
+git -C "$TT_UP" checkout -q "${TT_PIN:-086bf6c16}" 2>/dev/null \
+    || echo "   (checkout ${TT_PIN:-086bf6c16} 没成功,用的是当前 HEAD:$(git -C "$TT_UP" log --oneline -1))"
+# 其余 submodule(KPBot 那条)该拉还是拉,但失败不致命 —— 和本流程无关。
+git -C "$TT_DIR" submodule update --init --recursive >/dev/null 2>&1 \
+    || echo "   (submodule 拉取失败,与 torchtitan 无关,忽略)"
+"$P" -m pip install -q --no-deps -e "$TT_UP" || die "装 torchtitan 失败" \
+    "目录是 $TT_UP" \
+    "--no-deps 是故意的:torchtitan 钉 torch==2.14.0.dev20260719,让 pip 去解会拆环境。"
 "$P" -m pip install -q --no-deps -e "$TT_DIR" || die "装 torchtitan_npu 失败"
 # requirements.txt 没列但缺的那批。spmd_types 必须是 0.2.3(torchtitan 0.3.0 钉的)。
 pip_install -q \
@@ -141,7 +163,10 @@ cpu_only "$P" -c 'import torchtitan_npu.train; print("TRAIN IMPORT OK")' \
 # ---------------------------------------------------------------- GATE 4
 say "5. 分组专家 LoRA 能挂上 Qwen3.5-35B-A3B 吗  (GATE 4)"
 echo "这是整条 LoRA 线的闸门。纯 CPU,不占卡。"
-cpu_only "$P" -I "$REPO_ROOT/verify/probe_lora_tree.py"
+# 这里**不要**加 `-I`。-I 隐含 -E(忽略 PYTHONPATH)和 -s(去掉 user site),
+# 于是 GATE 4 失败后想用 PYTHONPATH / TT_ROOT 救一把的那条路也被堵死。
+# 包是装进本 conda 环境的 prefix,隔离在这儿什么也不买。
+cpu_only env TT_ROOT="$TT_DIR" "$P" "$REPO_ROOT/verify/probe_lora_tree.py"
 RC=$?
 
 say "完成"
