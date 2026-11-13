@@ -23,6 +23,7 @@ PIP_IDX="${PIP_IDX:-}"   # 留空用 pip 自己的默认源
 # 2026-11-05 复查:两个 wheel 都仍可下载。**不要只升一个**,见 GATE 2。
 TORCH_WHL_USER="${TORCH_WHL:-}"   # 非空 = 用户自己换了 wheel,版本/架构检查放行
 TORCH_WHL="${TORCH_WHL:-https://download.pytorch.org/whl/nightly/cpu/torch-2.14.0.dev20260719%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl}"
+TORCH_WANT="${TORCH_WANT:-2.14.0.dev20260719}"   # 默认 wheel 对应的版本号,用来判断"已经装好了"
 TORCH_NPU_VER="${TORCH_NPU_VER:-2.14.0.dev20260808}"
 TORCH_NPU_IDX="${TORCH_NPU_IDX:-https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html}"
 
@@ -178,23 +179,40 @@ else
 fi
 
 say "pip 自举"
-pip_install -q -U pip setuptools wheel || die "pip 自举失败" "网络问题请确认 proxy 已按本机要求关掉"
+pip_install -U pip setuptools wheel || die "pip 自举失败" "网络问题请确认 proxy 已按本机要求关掉"
 
 # ---------------------------------------------------------------- GATE 1
 say "1. torch  (GATE 1)"
-echo "wheel: $TORCH_WHL"
-"$P" -m pip install -q --no-deps "$TORCH_WHL" \
+# 已经装着核对过的那个版本就不再下载。download.pytorch.org 和 PyPI 镜像对 proxy
+# 的要求可能正好相反(一个通另一个就超时),手动下载 wheel 装好之后再跑本脚本,
+# 不该又去连一次 download.pytorch.org。用户显式给了 TORCH_WHL 时照装不误。
+pkg_ver() { "$P" -c 'import sys, importlib.metadata as m; print(m.version(sys.argv[1]))' "$1" 2>/dev/null || true; }
+HAVE_TORCH="$(pkg_ver torch)"
+if [ -z "$TORCH_WHL_USER" ] && [ "${HAVE_TORCH#"$TORCH_WANT"}" != "$HAVE_TORCH" ]; then
+    echo "已装 torch $HAVE_TORCH,就是核对过的 $TORCH_WANT,跳过下载。"
+    echo "(要强制重装:TORCH_WHL=<直链或本地 .whl 路径> 重跑)"
+else
+    [ -n "$HAVE_TORCH" ] && echo "当前装的是 torch $HAVE_TORCH,不是核对过的 $TORCH_WANT,下面会换掉它。"
+    echo "wheel: $TORCH_WHL"
+    "$P" -m pip install --no-deps "$TORCH_WHL" \
     || die "torch 下载/安装失败" \
            "先看上面 pip 的原话:" \
            "  'is not a supported wheel on this platform' = wheel 的 tag 和解释器/架构不符," \
            "     不是链接问题(用了自定义 TORCH_WHL 时检查它的 cpXY 和 aarch64)。" \
-           "  404 / 连接超时 = 直链可能已被回收,或 proxy 状态不对。" \
+           "  ConnectTimeoutError / Retrying = 这台机器当前连不上 download.pytorch.org。" \
+           "     它和 PyPI 镜像对 proxy 的要求可能相反。两条路:" \
+           "       a) 切 proxy 状态后重跑(索引探测那步若因此不通,用 PIP_IDX 指一个通的镜像);" \
+           "       b) 在能下的地方把上面那个 wheel 下到本地,然后" \
+           "            TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh" \
+           "          TORCH_WHL 可以是本地文件,pip 直接认。" \
+           "  404 = 直链可能已被回收。" \
            "直链失效时去 https://download.pytorch.org/whl/nightly/cpu/torch/" \
            "找最接近 2026-07-19 的 aarch64 cp312 nightly,用 TORCH_WHL=<url> 覆盖。" \
            "**换日期有风险**,见 GATE 2 的说明。"
+fi
 # torch 是 --no-deps 装的,它 import 时要的这几个纯 Python 包得单独补。
 # 以前这行没有 `|| die`:装失败了脚本照样往下走,最后报的是 "import torch 失败"。
-pip_install -q filelock fsspec jinja2 networkx sympy typing-extensions \
+pip_install filelock fsspec jinja2 networkx sympy typing-extensions \
     || die "torch 的运行依赖安装失败(torch 本体已装上)" \
            "这几个都是 PyPI 上的普通包,装不上就是索引问题,不是 torch 的问题。" \
            "换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
@@ -202,11 +220,24 @@ pip_install -q filelock fsspec jinja2 networkx sympy typing-extensions \
 
 # ---------------------------------------------------------------- GATE 2
 say "2. torch_npu $TORCH_NPU_VER  (GATE 2 —— 最容易炸的一步)"
-"$P" -m pip install -q --no-deps --find-links "$TORCH_NPU_IDX" "torch_npu==$TORCH_NPU_VER" \
+HAVE_NPU="$(pkg_ver torch_npu)"
+if [ "${HAVE_NPU#"$TORCH_NPU_VER"}" != "$HAVE_NPU" ]; then
+    echo "已装 torch_npu $HAVE_NPU,跳过下载。"
+else
+    [ -n "$HAVE_NPU" ] && echo "当前装的是 torch_npu $HAVE_NPU,不是 $TORCH_NPU_VER,下面会换掉它。"
+    # --no-deps 不能省:让 pip 去解 torch_npu 的依赖的话,它可能把上面装好的
+    # 那个 nightly 换成索引里能找到的别的 torch(torch_npu 的元数据里具体声明了
+    # 什么没逐版核过,所以不赌)。
+    "$P" -m pip install --no-deps --find-links "$TORCH_NPU_IDX" "torch_npu==$TORCH_NPU_VER" \
     || die "torch_npu 安装失败" \
            "看索引里现有哪些版本:" \
            "  curl -sS $TORCH_NPU_IDX | grep -oE 'torch_npu-[0-9.a-z]*'" \
-           "2026-11-05 时有 2.12.0.dev20260808 / 2.14.0.dev20260808 / 2.14.0.dev20260918"
+           "2026-11-05 时有 2.12.0.dev20260808 / 2.14.0.dev20260808 / 2.14.0.dev20260918" \
+           "连不上时也可以手动下 wheel 再装,但**一定带 --no-deps**:" \
+           "  $P -m pip install --no-deps <本地 torch_npu .whl>" \
+           "不带的话 pip 会去解 torch_npu 的依赖,有可能把装好的 torch 换掉。"
+fi
+echo "此刻环境里:torch $(pkg_ver torch) / torch_npu $(pkg_ver torch_npu)"
 if ! "$P" -c 'import torch, torch_npu; print("torch_npu", torch_npu.__version__)'; then
     die "import torch_npu 失败" \
         "两种典型原因:" \
@@ -240,22 +271,24 @@ if [ ! -d "$TT_UP/.git" ]; then
 fi
 # 钉在本项目核对过的那个 commit(torchtitan 0.3.0)。漂移了再往上走要重新核
 # state_dict_adapter 的键映射和 model_registry 的签名。
-git -C "$TT_UP" checkout -q "${TT_PIN:-086bf6c16}" 2>/dev/null \
-    || echo "   (checkout ${TT_PIN:-086bf6c16} 没成功,用的是当前 HEAD:$(git -C "$TT_UP" log --oneline -1))"
+# 这里的 -q 是 git 的,只压掉十来行 "detached HEAD" 的建议文字;结果在下一行明说。
+git -C "$TT_UP" checkout -q "${TT_PIN:-086bf6c16}" \
+    || echo "   (checkout ${TT_PIN:-086bf6c16} 没成功,见上面 git 的报错)"
+echo "upstream torchtitan 在:$(git -C "$TT_UP" log --oneline -1)"
 # 其余 submodule(KPBot 那条)该拉还是拉,但失败不致命 —— 和本流程无关。
 git -C "$TT_DIR" submodule update --init --recursive >/dev/null 2>&1 \
     || echo "   (submodule 拉取失败,与 torchtitan 无关,忽略)"
-"$P" -m pip install -q --no-deps -e "$TT_UP" || die "装 torchtitan 失败" \
+"$P" -m pip install --no-deps -e "$TT_UP" || die "装 torchtitan 失败" \
     "目录是 $TT_UP" \
     "--no-deps 是故意的:torchtitan 钉 torch==2.14.0.dev20260719,让 pip 去解会拆环境。"
-"$P" -m pip install -q --no-deps -e "$TT_DIR" || die "装 torchtitan_npu 失败"
+"$P" -m pip install --no-deps -e "$TT_DIR" || die "装 torchtitan_npu 失败"
 # requirements.txt 没列但缺的那批。spmd_types 必须是 0.2.3(torchtitan 0.3.0 钉的)。
-pip_install -q \
+pip_install \
     attn-gym==0.0.9 pybind11 numpy PyYAML ninja scipy==1.13.1 safetensors==0.8.0 \
     "spmd_types==0.2.3" torchdata tensorboard tyro blobfile tiktoken tomli_w tabulate \
     "datasets==4.7.0" tokenizers sentencepiece psutil wandb torch_checkpointing \
     || die "其余依赖安装失败" "要换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
-"$P" -m pip install -q --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple "triton-ascend==3.2.1" \
+"$P" -m pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple "triton-ascend==3.2.1" \
     || echo "   (triton-ascend 装失败。Qwen 的 gated_delta 走 Triton kernel,训练前要补上)"
 
 # ---------------------------------------------------------------- GATE 3

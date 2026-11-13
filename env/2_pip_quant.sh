@@ -37,7 +37,7 @@ echo "解释器: $P"
 "$P" -V
 
 say "装包"
-pip_install -q -U pip setuptools wheel || die "pip 自举失败" "网络问题请确认 proxy 已按本机要求关掉"
+pip_install -U pip setuptools wheel || die "pip 自举失败" "网络问题请确认 proxy 已按本机要求关掉"
 pip_install -r "$REPO_ROOT/env/quant-requirements.txt" \
     || die "装量化线依赖失败" \
            "网络问题请确认 proxy 已按本机要求关掉" \

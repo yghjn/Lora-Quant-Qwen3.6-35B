@@ -560,6 +560,23 @@ torch 的 wheel 是 `download.pytorch.org` 的直链,不经索引,所以它下�
 修法是换镜像(`PIP_IDX=<镜像地址> bash env/2_pip_train.sh`)或把 proxy 切回
 上次 pip 装成功时的状态。
 
+**`download.pytorch.org` 连不上长什么样。** pip 反复打
+`Retrying ... ConnectTimeoutError ... download.pytorch.org`。它和 PyPI 镜像对 proxy
+的要求可能正好相反 —— 一个通,另一个就超时,同一次运行里没法两全。做法是把 torch
+那个 wheel 单独弄下来:
+
+```bash
+TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
+```
+
+或者先手动 `pip install --no-deps <本地 .whl>` 再直接跑脚本:环境里已经是核对过的
+`2.14.0.dev20260719` 时,脚本会跳过下载,不再去连 `download.pytorch.org`
+(torch_npu 同理)。手动装 torch_npu 时**一定带 `--no-deps`**,否则 pip 会去解它的
+依赖,有可能把装好的 torch 换掉。
+
+两个安装脚本里 pip 都不带 `-q`:输出长,但哪一步、哪个包、连的哪个地址出问题
+都直接看得到。
+
 版本组合(2026-11-05 复查,两个 wheel 都仍可下载):
 
 | 包 | 版本 |
