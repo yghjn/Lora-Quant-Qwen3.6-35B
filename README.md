@@ -390,6 +390,15 @@ Qwen3.5/3.6-35B-A3B 的配置树。**不需要权重、不需要卡**,但需要 
 | Ascend 插件 | `torchtitan_npu` | `https://gitcode.com/cann/torchtitan-npu.git` | `3f9f99a`(0.1.0) | **>= 3.12** |
 | upstream | `torchtitan` | `https://gitcode.com/GitHub_Trending/to/torchtitan.git` | `086bf6c16`(0.3.0) | >= 3.11 |
 
+**"核对过的版本"这一列必须照做,两个仓库都要 checkout 到表里的 commit。**
+torchtitan-npu 的 master 一直在走:2026-11-14 的 `cbad953` 比 `3f9f99a` 多 166 个提交,
+`requirements.txt` 已经换了一整套 —— 正式版 `torch==2.14.0` / `torch_npu==2.14.0`
+(不是这里用的 `dev20260719` / `dev20260808`)、`attn-gym==0.0.16`(不是 `0.0.9`),
+CANN 也升了。master 配本项目装的那套包会在 `import torchtitan_npu` 时报
+`No module named 'attn_gym.sparse.gather_attn'`。本项目的 LoRA 配置树和 state_dict
+键映射都是照 `3f9f99a` 核的。安装脚本会自动切过去(工作区有未提交改动时停下不动);
+确实要跟 master 就 `TTNPU_PIN=none`,并自己照它的 `requirements.txt` 对齐全部版本。
+
 upstream 要放在插件仓库的 `third_party/torchtitan/` 下。**三个事实合在一起,
 就是"常规方法装不上"的全部原因:**
 
@@ -441,6 +450,10 @@ torchtitan-npu 默认放 `~/src/torchtitan-npu`,要换位置就 `TT_DIR=<目录>
 
 ```bash
 git clone https://gitcode.com/cann/torchtitan-npu.git ~/src/torchtitan-npu
+```
+
+```bash
+git -C ~/src/torchtitan-npu checkout 3f9f99a
 ```
 
 ```bash
@@ -543,7 +556,7 @@ conda activate lqq-train && bash env/2_pip_train.sh
 | 前置 | pip 索引取得到包(真下载一次 `filelock`,不装) | 镜像/代理状态不对。不探的话会滑到闸门 1 才露头,见下面"索引不通长什么样" |
 | 1 | torch 装上且能 import | 直链被回收 |
 | 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
-| 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule) |
+| 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule);或 torchtitan-npu 没钉在 `3f9f99a`(报 `No module named 'attn_gym.…'`) |
 | 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑" |
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。

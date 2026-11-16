@@ -276,6 +276,46 @@ if [ ! -d "$TT_DIR/.git" ]; then
     mkdir -p "$(dirname "$TT_DIR")"
     git clone https://gitcode.com/cann/torchtitan-npu.git "$TT_DIR" || die "clone torchtitan-npu 失败"
 fi
+# torchtitan-npu **必须钉 commit**。以前这里 clone 完就用 master,而 master 在走:
+# 2026-11-14 的 cbad953 比核对过的 3f9f99a(2026-09-30)多 166 个提交,
+# requirements.txt 已经换了一整套 —— torch==2.14.0 / torch_npu==2.14.0(正式版,
+# 不是本脚本装的 dev20260719 / dev20260808)、attn-gym==0.0.16(不是 0.0.9)、
+# CANN 也升了。拿 master 配本脚本装的那套包,GATE 3 就会死在
+#     ModuleNotFoundError: No module named 'attn_gym.sparse.gather_attn'
+# (patches/attn_gym/ 是 2026-10-20 才加的,3f9f99a 里没有这个目录)。
+# 本项目的 LoRA 配置树、state_dict 键映射都是照 3f9f99a 核的,所以钉它。
+# 想跟 master:TTNPU_PIN=none,然后自己照它的 requirements.txt 对齐全部版本。
+TTNPU_PIN="${TTNPU_PIN:-3f9f99a}"
+if [ "$TTNPU_PIN" = "none" ]; then
+    echo "TTNPU_PIN=none:不钉 torchtitan-npu,用它当前所在的 commit。"
+    echo "   torch / torch_npu / attn-gym 的版本得你自己照它的 requirements.txt 对齐。"
+else
+    TTNPU_WANT="$(git -C "$TT_DIR" rev-parse --verify -q "$TTNPU_PIN^{commit}" || true)"
+    if [ -z "$TTNPU_WANT" ]; then
+        git -C "$TT_DIR" fetch origin || true
+        TTNPU_WANT="$(git -C "$TT_DIR" rev-parse --verify -q "$TTNPU_PIN^{commit}" || true)"
+    fi
+    [ -n "$TTNPU_WANT" ] || die "torchtitan-npu 仓库里找不到 commit $TTNPU_PIN" \
+        "目录是 $TT_DIR。浅克隆(--depth)拿不到历史 commit,要完整 clone。"
+    TTNPU_CUR="$(git -C "$TT_DIR" rev-parse HEAD)"
+    if [ "$TTNPU_CUR" != "$TTNPU_WANT" ]; then
+        # 只看已跟踪文件:third_party/ 和 *.egg-info 都被它的 .gitignore 挡着,不算改动。
+        TTNPU_DIRTY="$(git -C "$TT_DIR" status --porcelain --untracked-files=no)"
+        if [ -n "$TTNPU_DIRTY" ]; then
+            printf '%s\n' "$TTNPU_DIRTY" | head -10 | sed 's/^/    /'
+            die "$TT_DIR 不在核对过的 commit 上,而且有未提交的改动,不替你切" \
+                "当前:$(git -C "$TT_DIR" log --oneline -1)" \
+                "需要:$TTNPU_PIN" \
+                "先自己处理上面列出的改动(提交 / stash / 另找一个干净目录用 TT_DIR=<目录>)," \
+                "或者明确要用当前这个版本:TTNPU_PIN=none 重跑。"
+        fi
+        TTNPU_PREV="$(git -C "$TT_DIR" symbolic-ref -q --short HEAD || git -C "$TT_DIR" rev-parse --short HEAD)"
+        git -C "$TT_DIR" checkout -q "$TTNPU_WANT" || die "切到 $TTNPU_PIN 失败,见上面 git 的报错"
+        echo "torchtitan-npu:从 $TTNPU_PREV($(git -C "$TT_DIR" rev-parse --short "$TTNPU_CUR"))切到核对过的 $TTNPU_PIN。"
+        echo "   想回去:git -C $TT_DIR checkout $TTNPU_PREV"
+    fi
+fi
+echo "torchtitan-npu 在:$(git -C "$TT_DIR" log -1 --format='%h %ad %s' --date=short)"
 # upstream torchtitan **不是 submodule**:`.gitmodules` 里只有
 # third_party/agent-skills/KPBot 一条,而 third_party/ 本身还被 torchtitan-npu
 # 自己的 .gitignore 挡掉(第 115 行 `/third_party/`)。所以 clone 下来
@@ -314,10 +354,19 @@ pip_install \
 
 # ---------------------------------------------------------------- GATE 3
 say "4. torchtitan_npu 能 import 吗  (GATE 3)"
+echo "torchtitan-npu $(git -C "$TT_DIR" rev-parse --short HEAD) / attn-gym $(pkg_ver attn-gym) / torch $(pkg_ver torch) / torch_npu $(pkg_ver torch_npu)"
 cpu_only "$P" -c 'import torchtitan_npu.train; print("TRAIN IMPORT OK")' \
     || die "import torchtitan_npu 失败" \
-           "若报 cannot import name 'DataParallelMeshDims' from 'torch.distributed.fsdp'," \
-           "说明 torch 太旧(需要 2.14 系列)。GATE 1 装对了就不该出现这条。"
+           "看上面 traceback 的最后一行:" \
+           "  No module named 'attn_gym.<某子模块>'" \
+           "      = torchtitan-npu 的 commit 和 attn-gym 的版本不是一套。" \
+           "        核对过的组合是 torchtitan-npu 3f9f99a + attn-gym 0.0.9;" \
+           "        master(2026-11 起)要 attn-gym 0.0.16 和正式版 torch / torch_npu 2.14.0。" \
+           "        对照上面那行版本。用了 TTNPU_PIN=none 就得自己对齐。" \
+           "  cannot import name 'DataParallelMeshDims' from 'torch.distributed.fsdp'" \
+           "      = torch 太旧(需要 2.14 系列)。GATE 1 装对了就不该出现这条。" \
+           "  结尾那行 '[ERROR] ... ERR99999 UNKNOWN applicaiton exception' 是 torch_npu 在" \
+           "  Python 异常退出时打的,不是另一个错误,不用管。"
 
 # ---------------------------------------------------------------- GATE 4
 say "5. 分组专家 LoRA 能挂上 Qwen3.5-35B-A3B 吗  (GATE 4)"
