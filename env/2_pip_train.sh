@@ -212,11 +212,28 @@ else
 fi
 # torch 是 --no-deps 装的,它 import 时要的这几个纯 Python 包得单独补。
 # 以前这行没有 `|| die`:装失败了脚本照样往下走,最后报的是 "import torch 失败"。
+#
+# 同一行把 torch_npu import 时要的包也装掉(numpy / PyYAML / packaging)。
+# torch_npu 的 wheel **没声明**这些依赖 —— 它的 METADATA 里只有一条
+# `Requires-Dist: torch==2.14.0.dev20260719`(2026-11-16 读 wheel 核过),但
+# `import torch_npu` 一路会 import numpy(profiler),源码顶层还 import yaml 和
+# packaging。这些以前排在 GATE 2 之后的"其余依赖"里才装,于是 GATE 2 的
+# `import torch_npu` 必然死在 "No module named 'numpy'"。
+# numpy 钉 <2.3:后面要装的 scipy==1.13.1 要求 numpy<2.3,>=1.22.4,
+# 这里不钉的话会先装最新的、到那一步再被降级一次。
 pip_install filelock fsspec jinja2 networkx sympy typing-extensions \
-    || die "torch 的运行依赖安装失败(torch 本体已装上)" \
+            "numpy<2.3" PyYAML packaging \
+    || die "torch / torch_npu 的运行依赖安装失败(torch 本体已装上)" \
            "这几个都是 PyPI 上的普通包,装不上就是索引问题,不是 torch 的问题。" \
            "换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
-"$P" -c 'import torch; print("torch", torch.__version__)' || die "import torch 失败"
+# GATE 1 只验 torch 自己。torch_npu 在 entry_points 里注册了
+# `[torch.backends] torch_npu = torch_npu:_autoload`,所以只要它装着,
+# `import torch` 就会顺带把它拉起来 —— torch_npu 的任何毛病(缺包、ABI、CANN)
+# 都会被报成 "import torch 失败"。关掉自动加载,把这两道闸门分开。
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$P" -c 'import torch; print("torch", torch.__version__)' \
+    || die "import torch 失败" \
+           "这一步关掉了后端自动加载(TORCH_DEVICE_BACKEND_AUTOLOAD=0),所以和 torch_npu 无关," \
+           "是 torch 本体或它的纯 Python 依赖的问题。看上面的 traceback 最后一行。"
 
 # ---------------------------------------------------------------- GATE 2
 say "2. torch_npu $TORCH_NPU_VER  (GATE 2 —— 最容易炸的一步)"
@@ -225,9 +242,9 @@ if [ "${HAVE_NPU#"$TORCH_NPU_VER"}" != "$HAVE_NPU" ]; then
     echo "已装 torch_npu $HAVE_NPU,跳过下载。"
 else
     [ -n "$HAVE_NPU" ] && echo "当前装的是 torch_npu $HAVE_NPU,不是 $TORCH_NPU_VER,下面会换掉它。"
-    # --no-deps 不能省:让 pip 去解 torch_npu 的依赖的话,它可能把上面装好的
-    # 那个 nightly 换成索引里能找到的别的 torch(torch_npu 的元数据里具体声明了
-    # 什么没逐版核过,所以不赌)。
+    # --no-deps:torch_npu 的 METADATA 只声明了 `torch==2.14.0.dev20260719`。
+    # 环境里正好是这个版本时带不带都一样;不是的话 pip 会去索引里找这个 nightly,
+    # 找不到就整条失败,报错还指向 torch 而不是 torch_npu。带上就没这层干扰。
     "$P" -m pip install --no-deps --find-links "$TORCH_NPU_IDX" "torch_npu==$TORCH_NPU_VER" \
     || die "torch_npu 安装失败" \
            "看索引里现有哪些版本:" \
@@ -235,12 +252,16 @@ else
            "2026-11-05 时有 2.12.0.dev20260808 / 2.14.0.dev20260808 / 2.14.0.dev20260918" \
            "连不上时也可以手动下 wheel 再装,但**一定带 --no-deps**:" \
            "  $P -m pip install --no-deps <本地 torch_npu .whl>" \
-           "不带的话 pip 会去解 torch_npu 的依赖,有可能把装好的 torch 换掉。"
+           "不带的话 pip 会去解它声明的 torch==2.14.0.dev20260719,环境里不是这个版本就会失败。"
 fi
 echo "此刻环境里:torch $(pkg_ver torch) / torch_npu $(pkg_ver torch_npu)"
 if ! "$P" -c 'import torch, torch_npu; print("torch_npu", torch_npu.__version__)'; then
     die "import torch_npu 失败" \
-        "两种典型原因:" \
+        "先看上面 traceback 的最后一行。" \
+        "  0) ModuleNotFoundError: No module named 'X':torch_npu 的 wheel 没声明它的运行依赖," \
+        "     缺什么补什么:$P -m pip install X,然后重跑。已知要的是 numpy / PyYAML / packaging" \
+        "     (本脚本在 GATE 1 已装);若冒出别的名字,请把它记进脚本那一行。" \
+        "另外两种典型原因:" \
         "  a) ABI 不符:报 'Mismatch in kernel C++ signatures' 然后 abort。" \
         "     torch_npu 是照某个具体 torch nightly 编的 —— dev20260808 对的是 torch dev20260719。" \
         "     aten::_scaled_grouped_mm_v2 的 Tensor[] 参数在 0719 到 0731 之间从" \

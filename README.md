@@ -571,8 +571,9 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
 
 或者先手动 `pip install --no-deps <本地 .whl>` 再直接跑脚本:环境里已经是核对过的
 `2.14.0.dev20260719` 时,脚本会跳过下载,不再去连 `download.pytorch.org`
-(torch_npu 同理)。手动装 torch_npu 时**一定带 `--no-deps`**,否则 pip 会去解它的
-依赖,有可能把装好的 torch 换掉。
+(torch_npu 同理)。手动装 torch_npu 时带上 `--no-deps`:它的 wheel 只声明了一条依赖
+`torch==2.14.0.dev20260719`,环境里不是这个版本时 pip 会去索引里找这个 nightly,
+找不到就整条失败。
 
 两个安装脚本里 pip 都不带 `-q`:输出长,但哪一步、哪个包、连的哪个地址出问题
 都直接看得到。
@@ -599,6 +600,16 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
 * **torch 版本被钉死。** torchtitan-npu 要 `torch==2.14.0.dev20260719`,
   用更新的 nightly 会在 `import torch_npu` 时因 ABI 不符直接 abort。
   量化线不受影响(2.7 起都可以)。
+* **`import torch` 会顺带加载 torch_npu。** torch_npu 在 entry_points 里注册了
+  `[torch.backends]`,只要它装着,`import torch` 就自动把它拉起来 —— 于是 torch_npu 的
+  任何毛病都会被报成 `Failed to load the backend extension: torch_npu`,看着像 torch 坏了。
+  想单独验 torch 本体:`TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import torch'`
+  (安装脚本的闸门 1 就是这么跑的)。
+* **torch_npu 的 wheel 没声明它的运行依赖。** `import torch_npu` 要 numpy,源码顶层
+  还 import yaml 和 packaging,但 METADATA 里只有 `torch==...` 一条(2026-11-16 读
+  `2.14.0.dev20260808` 的 wheel 核过)。所以先手动装了 torch_npu、其余包还没装时,
+  会得到 `No module named 'numpy'`。安装脚本现在在闸门 1 之前就把这三个装上,
+  numpy 钉 `<2.3`(`scipy==1.13.1` 的要求)。
 * **环境不要建在 `/dev/shm`。** 上一份训练环境就建在那里,随重启整个消失。
 * **CANN 版本决定融合算子可用性。** 9.0.1 缺 `aclnnMhcPost` / `aclnnSparseFlashMla`
   等符号,9.1.0 才有;而且 `libopapi.so` 在 ops 包里,只装 toolkit 验不出来。
