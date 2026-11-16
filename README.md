@@ -621,8 +621,16 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
 * **torch_npu 的 wheel 没声明它的运行依赖。** `import torch_npu` 要 numpy,源码顶层
   还 import yaml 和 packaging,但 METADATA 里只有 `torch==...` 一条(2026-11-16 读
   `2.14.0.dev20260808` 的 wheel 核过)。所以先手动装了 torch_npu、其余包还没装时,
-  会得到 `No module named 'numpy'`。安装脚本现在在闸门 1 之前就把这三个装上,
-  numpy 钉 `<2.3`(`scipy==1.13.1` 的要求)。
+  会得到 `No module named 'numpy'`。安装脚本现在在闸门 1 之前就把这三个装上。
+* **numpy 必须落在 `>=2.0,<2.3`。** 上界来自 `scipy==1.13.1`(要求 `numpy<2.3`);
+  下界来自 `datasets` 拉进来的新版 pyarrow —— 它在 import 时检查 numpy,1.x 直接报
+  `pyarrow requires NumPy 2.0 or newer`,闸门 3 就过不去。坑在于 pyarrow 的元数据里
+  **没声明** numpy,所以 pip 不会替你升:环境里先有了一个 numpy 1.26.4(手动装的、
+  或内部镜像给的旧版),只要求 `numpy<2.3` 会被判为"已满足"原样留下。脚本现在两头都钉。
+  本脚本装的包在 PyPI 上没有一个要求 `numpy<2`(2026-11-16 逐个查过)。
+* **闸门 3/4 里的 `aclInit ... error code is 107001` / `Invalid device ID` 是预期的。**
+  这两道闸门故意把 `ASCEND_RT_VISIBLE_DEVICES` 置空以免占卡,torchtitan_npu 的一个补丁
+  想初始化 NPU 没成,自己打一行 `[PATCH] ... skipped` 跳过。失败原因只看 Traceback。
 * **环境不要建在 `/dev/shm`。** 上一份训练环境就建在那里,随重启整个消失。
 * **CANN 版本决定融合算子可用性。** 9.0.1 缺 `aclnnMhcPost` / `aclnnSparseFlashMla`
   等符号,9.1.0 才有;而且 `libopapi.so` 在 ops 包里,只装 toolkit 验不出来。

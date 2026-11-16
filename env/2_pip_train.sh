@@ -219,10 +219,15 @@ fi
 # `import torch_npu` 一路会 import numpy(profiler),源码顶层还 import yaml 和
 # packaging。这些以前排在 GATE 2 之后的"其余依赖"里才装,于是 GATE 2 的
 # `import torch_npu` 必然死在 "No module named 'numpy'"。
-# numpy 钉 <2.3:后面要装的 scipy==1.13.1 要求 numpy<2.3,>=1.22.4,
-# 这里不钉的话会先装最新的、到那一步再被降级一次。
+# numpy 两头都钉,窗口是 [2.0, 2.3):
+#   上界:后面要装的 scipy==1.13.1 要求 numpy<2.3,>=1.22.4;
+#   下界:datasets 拉进来的新版 pyarrow 在 import 时检查 numpy,1.x 直接
+#         ImportError: pyarrow requires NumPy 2.0 or newer。pyarrow 的元数据里
+#         **没声明** numpy,所以 pip 不会替你升 —— 环境里原先有个 numpy 1.26.4
+#         的话,只写 "numpy<2.3" 会被判为"已满足"原样留下,到 GATE 3 才炸。
+NUMPY_SPEC="numpy>=2.0,<2.3"
 pip_install filelock fsspec jinja2 networkx sympy typing-extensions \
-            "numpy<2.3" PyYAML packaging \
+            "$NUMPY_SPEC" PyYAML packaging \
     || die "torch / torch_npu 的运行依赖安装失败(torch 本体已装上)" \
            "这几个都是 PyPI 上的普通包,装不上就是索引问题,不是 torch 的问题。" \
            "换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
@@ -345,19 +350,30 @@ git -C "$TT_DIR" submodule update --init --recursive >/dev/null 2>&1 \
 "$P" -m pip install --no-deps -e "$TT_DIR" || die "装 torchtitan_npu 失败"
 # requirements.txt 没列但缺的那批。spmd_types 必须是 0.2.3(torchtitan 0.3.0 钉的)。
 pip_install \
-    attn-gym==0.0.9 pybind11 numpy PyYAML ninja scipy==1.13.1 safetensors==0.8.0 \
+    attn-gym==0.0.9 pybind11 "$NUMPY_SPEC" PyYAML ninja scipy==1.13.1 safetensors==0.8.0 \
     "spmd_types==0.2.3" torchdata tensorboard tyro blobfile tiktoken tomli_w tabulate \
     "datasets==4.7.0" tokenizers sentencepiece psutil wandb torch_checkpointing \
     || die "其余依赖安装失败" "要换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
+TRITON_OK=1
 "$P" -m pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple "triton-ascend==3.2.1" \
-    || echo "   (triton-ascend 装失败。Qwen 的 gated_delta 走 Triton kernel,训练前要补上)"
+    || { TRITON_OK=0; echo "   (triton-ascend 装失败,不拦闸门 3/4;结尾会再提醒一次)"; }
 
 # ---------------------------------------------------------------- GATE 3
 say "4. torchtitan_npu 能 import 吗  (GATE 3)"
 echo "torchtitan-npu $(git -C "$TT_DIR" rev-parse --short HEAD) / attn-gym $(pkg_ver attn-gym) / torch $(pkg_ver torch) / torch_npu $(pkg_ver torch_npu)"
+echo "numpy $(pkg_ver numpy) / pyarrow $(pkg_ver pyarrow) / datasets $(pkg_ver datasets) / scipy $(pkg_ver scipy)"
+echo "(这一步故意不给 NPU:ASCEND_RT_VISIBLE_DEVICES 置空。所以下面若出现"
+echo " '[PATCH] ascendc gather dtype restriction skipped: ... aclInit, error code is 107001'"
+echo " 和一串 'Invalid device ID' —— 那是 torchtitan_npu 的一个补丁想初始化 NPU 没成,"
+echo " 自己跳过了,属于预期,不是失败原因。失败原因只看 Traceback。)"
 cpu_only "$P" -c 'import torchtitan_npu.train; print("TRAIN IMPORT OK")' \
     || die "import torchtitan_npu 失败" \
            "看上面 traceback 的最后一行:" \
+           "  ImportError: pyarrow requires NumPy 2.0 or newer, found 1.x" \
+           "      = numpy 太旧。pyarrow 不在元数据里声明 numpy,pip 不会自动升。" \
+           "        $P -m pip install \"$NUMPY_SPEC\"   然后重跑。" \
+           "        若 pip 说有别的包要求 numpy<2,记下是哪个包 —— PyPI 上本脚本装的包" \
+           "        没有一个这么要求(2026-11-16 逐个查过),多半是手动装进来的某个旧版本。" \
            "  No module named 'attn_gym.<某子模块>'" \
            "      = torchtitan-npu 的 commit 和 attn-gym 的版本不是一套。" \
            "        核对过的组合是 torchtitan-npu 3f9f99a + attn-gym 0.0.9;" \
@@ -382,6 +398,13 @@ echo "解释器: $P"
 echo "仓库:   $TT_DIR"
 [ "$RC" -eq 0 ] && echo "四道闸门全过。" \
     || echo "GATE 4 未过(rc=$RC)—— 上面的输出会指出是 import 问题还是判据不成立。"
+if [ "$TRITON_OK" -ne 1 ] && [ -z "$(pkg_ver triton-ascend)" ]; then
+    echo
+    echo "!! triton-ascend 没装上。四道闸门不依赖它,但 Qwen 的 gated_delta 走 Triton kernel,"
+    echo "   上卡训练之前必须补:"
+    echo "     $P -m pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple triton-ascend==3.2.1"
+    echo "   (那个索引是第四个外部地址,连不上时和 torch / torch_npu 一样,换 proxy 状态或手动下 wheel)"
+fi
 cat <<NOTE
 
 下一步(需要一张空闲卡):5 步 dry run,确认真权重能加载。
