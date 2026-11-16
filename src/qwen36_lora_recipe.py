@@ -13,6 +13,15 @@
 所以它可以整体替代那个 MODULE,**不用改 torchtitan-npu 仓库的任何一个文件**
 (那个 clone 里有别人未提交的工作,见 README 的"不要动的东西")。
 
+**"不用改"在一份干净的 clone 上要靠本仓库另外两个文件才成立**(2026-11-16 补)::
+
+    src/qwen36_lora_compat.py    converter。已提交的 lora.py 把根配置写死成 DSv4 的类,
+                                 Qwen 过不去;同事工作区里修了但没提交。
+    src/qwen36_adapter_save.py   adapter 落盘。原先 import 的 adapter_save.py 是同事
+                                 工作区里的未跟踪文件,干净 clone 里根本没有。
+
+本工单最初是照同事的**工作区**核的,不是照已提交的 ``3f9f99a``,这两处就是差出来的。
+
 退路:如果启动器坚持 MODULE 必须是 ``torchtitan_npu.models.qwen3_5``,
 就在该包 ``config_registry.py`` 末尾加一行::
 
@@ -93,10 +102,17 @@ def _lora_converters(rank: int, alpha: float) -> list:
     ``_validate_matches``(lora.py:582)会抛。没有它,后缀对不上就会静默
     退化成一个没有 adapter 的全量微调。
     """
-    from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter
+    # 不直接用 DeepSeekV4LoRAConverter.Config:已提交的 3f9f99a 里它的 convert()
+    # 最后一行把根配置派生成写死的 DSv4 根配置类,Qwen 会报
+    # "missing 4 required keyword-only arguments: 'hc_head', ..."。
+    # qwen36_lora_compat 在需要时套一层,不需要时原样返回原 converter。
+    # verify/probe_lora_tree.py 用的是同一个入口。
+    from qwen36_lora_compat import describe as _compat_describe
+    from qwen36_lora_compat import lora_converter_config
 
+    logger.info("LoRA converter: %s", _compat_describe())
     return [
-        DeepSeekV4LoRAConverter.Config(
+        lora_converter_config(
             rank=rank,
             alpha=alpha,
             rank_experts=rank,
@@ -179,9 +195,10 @@ def _wire_adapter_saver(config: Trainer.Config) -> Trainer.Config:
     def _hook(optimizers, model_parts, parallel_dims):
         if prev is not None:
             prev(optimizers, model_parts, parallel_dims)
-        from torchtitan_npu.patches.torchtitan.models.common.adapter_save import (
-            register_adapter_saver,
-        )
+        # 本仓库自带的 saver。原先 import 的
+        # torchtitan_npu.patches.torchtitan.models.common.adapter_save 是同事工作区里
+        # 的未跟踪文件,干净 clone 里没有 —— 会在加载完权重、建好优化器之后才炸。
+        from qwen36_adapter_save import register_adapter_saver
 
         if not register_adapter_saver(optimizers, model_parts):
             raise RuntimeError(

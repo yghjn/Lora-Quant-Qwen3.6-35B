@@ -109,6 +109,8 @@ src/
   fakequant_rtn.py         RTN 假量化,HF checkpoint -> bf16 checkpoint
   offline_ptq.py           工单 §2.2:离线 PTQ(RHT + 码本 + LDLQ),逐专家 Hessian
   qwen36_lora_recipe.py    工单 §6:LoRA trainer 配置(可整体替代 MODULE)
+  qwen36_lora_compat.py    converter 兼容层:已提交的 lora.py 把根配置写死成 DSv4,Qwen 过不去
+  qwen36_adapter_save.py   adapter 周期落盘(原先依赖的文件在干净 clone 里不存在)
   prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死
   merge_lora.py            工单 §7.1/§7.2:adapter 合并回 bf16 checkpoint
   mp_select.py             工单 §4.1:按路由计数挑热专家 + 位宽账(--bits-table)
@@ -118,7 +120,9 @@ verify/
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,22 项,纯 CPU,参考值用 einsum 独立算
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
+  test_adapter_save_cpu.py adapter 落盘自测,15 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
+  probe_recipe_cpu.py      训练配置能否 import / 构造(需训练环境;安装脚本的闸门 5)
 ```
 
 `src/unisvq_core.py` 是内部 UniSVQ 参考实现的 vendoring 副本,相对原版只改了
@@ -138,7 +142,7 @@ verify/
 | §2.1 `N_BITS` 接环境变量 | **完成** |
 | 内核 vendoring + 自测 | **完成**,24 项全过 |
 | §1.1 `fakequant_rtn.py` | **完成**,端到端自测全过 |
-| §0.1 LoRA 配置树检查 | 脚本就绪,**待在训练环境执行** |
+| §0.1 LoRA 配置树检查 | **通过**(2026-11-16,开发机上一个全新的 3.12 环境 + 干净 clone + 兼容层,9 条判据全 OK)。另一台机器上待复跑 |
 | §0.2 下权重 / §0.3 形状预检 | 未做 |
 | §2.2 `offline_ptq.py` | **代码完成**,55 项自测全过;真激活未跑过 |
 | §2.3 单层 dry-run | 合成数据上过了;**真权重 + 真激活未做** |
@@ -147,20 +151,22 @@ verify/
 | §4.1 `mp_select.py` 挑热专家 | **代码完成**,60 项自测全过;真激活未跑过 |
 | §4.2 `--keep-hot` 跳过热专家 | **代码完成**,保留专家逐位直通已验 |
 | §4.3 混精评测 | 未做,卡被占 |
-| §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`),**未上卡跑过** |
+| §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**未上卡跑过** |
+| §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),15 项自测全过;真训练未跑过 |
 | §6.6 语料 + chat template | **完成**,两条路径都冒烟过 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,22 项自测全过 |
 | §6 LoRA 训练本身 | 未做,卡被占 + 训练环境未建 |
 
 ### LoRA 线的三件代码就位之后,还差什么
 
-1. **训练环境**(`env/2_pip_train.sh`,要 proxy 关)—— 四道闸门一次都没过。
-2. **§0.1 闸门**:`verify/probe_lora_tree.py`,纯 CPU 不占卡,但需要上面那个环境。
-3. **一张空闲卡**跑 `qwen36_35b_a3b_lora_smoke`(20 步)。
+1. **训练环境**(`env/2_pip_train.sh`)—— 2026-11-16 在开发机的一个全新环境里
+   **五道闸门全过**(CANN 8.5.1,纯 CPU)。另一台机器上闸门 1–3 已过,4/5 待复跑。
+2. **§0.1 闸门**:`verify/probe_lora_tree.py` —— 同上,已过。
+3. **一张空闲卡**跑 `qwen36_35b_a3b_lora_smoke`(20 步)。**这一步还没人跑过。**
 
-第 3 步之前,`qwen36_lora_recipe.py` 的全部论证都只是静态读码得来的 ——
-见该文件头部"为什么能复用 DSv4 的 LoRA converter"。静态部分已逐条核对到
-行号,但 `convert()` 走完之后配置树长什么样,只有 §0.1 说得清。
+闸门 4/5 验到的是:converter 能把 40 层路由专家换成 LoRA 版、一层专家模块能
+实例化且 adapter 参数量对得上解析值、三个训练配置能构造。**没验到的**是真权重
+加载、前向、反传、分布式切分和 adapter 实际落盘 —— 这些要第 3 步。
 
 ## 实测结果
 
@@ -183,7 +189,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 六个会改排期的发现
+### 七个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -271,6 +277,28 @@ Hessian 感知量化干的就是这件事:把误差挪到激活不激发的方�
 
 顺带两件:bf16 保留让 2bit 产物从 8.05 GB 涨到 13.78 GB(几乎翻倍);
 3bit 基座下 DSv4.1 **没有**混精的公开数,所以那一行只能当推算值,不能当靶子。
+
+**七、工单是照同事的工作区核的,不是照已提交的代码 —— 干净 clone 上差两处。**
+
+2026-11-16 第一次在一份干净的 `torchtitan-npu@3f9f99a` 上跑闸门 0.1,报
+`_LoRAModelConfig.__init__() missing 4 required keyword-only arguments: 'hc_head', ...`。
+逐条核对本仓库的 import 之后,确认有两样东西**只存在于 `l84414662` 的工作区、从未提交**:
+
+| 缺什么 | 在同事工作区里的状态 | 干净 clone 上的后果 | 本仓库的处理 |
+|---|---|---|---|
+| `lora.py` 里按实际根配置类派生 `_LoRAModelConfig` 的修复(27 行) | 已修改、未提交 | `convert()` 最后一行把根配置派生成写死的 DSv4 类,Qwen 直接 TypeError | `src/qwen36_lora_compat.py`:只在 `convert()` 期间替换那个模块全局,不改 torchtitan-npu |
+| `patches/torchtitan/models/common/adapter_save.py` | 未跟踪文件 | 训练能启动、加载完 70 GB 权重、建好优化器,然后才 `ModuleNotFoundError` | `src/qwen36_adapter_save.py`:自带一份,落盘格式与 `merge_lora.py` 的读法对拍 |
+
+TypeError 出在 `convert()` 的**最后一行**:前面的树遍历、后缀匹配、strict 校验都已通过。
+所以"分组专家 LoRA 能复用到 Qwen"这个判断本身是对的,错的是"一个文件都不用改"
+这句话的前提。同事工作区里对 upstream torchtitan 还有两处未提交改动
+(`text_datasets.py` 加了三个 DSv4 语料、`protocols/module.py` 为 int8 基座保留
+`requires_grad`),本路线都用不到。
+
+同一次实跑还查出:训练入口 `torchtitan_npu.models.qwen3_5` 需要 `torchvision`
+(闸门 0.1 的入口是 upstream 的 `torchtitan.models.qwen3_5`,走不到),
+以及 probe 自己的三处错 —— 按 `__dict__` 遍历 slots 配置所以一个节点都数不到、
+按类名里有没有 "LoRA" 判断所以全是假阴性、把结论性失败报成环境问题。都已修。
 
 ## 下一步
 
@@ -361,7 +389,13 @@ cd ~/src/torchtitan-npu && NGPU=1 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3
 
 `MODULE=qwen36_lora_recipe` 不是 `torchtitan_npu.models.qwen3_5` —— 那个模块的
 全部名字都被搬进了我们这个模块,所以它是**超集**,而 torchtitan-npu 的
-clone 一个文件都不用改(那里有别人未提交的工作)。
+clone 一个文件都不用改。在一份**干净的** clone 上这句话要靠本仓库的
+`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"七个会改排期的
+发现"第七条。起训练之前先确认闸门 5 过了:
+
+```bash
+python3 verify/probe_recipe_cpu.py
+```
 
 训完合并:
 
@@ -369,7 +403,8 @@ clone 一个文件都不用改(那里有别人未提交的工作)。
 python src/merge_lora.py --base <假量化ckpt> --adapter <adapter输出目录> --rank 16 --alpha 32 --dry-run
 ```
 
-`--alpha` **故意没有默认值**:`adapter_save.py` 写的 metadata 里那个
+`--alpha` **故意没有默认值**:adapter 分片(`qwen36_adapter_save.py`,格式同
+DSv4.1 的 `adapter_save.py`)的 metadata 里那个
 `rank` 是**进程 rank**,alpha 根本没存进去。DSv4.1 就是在这里把 delta
 放大了 8 倍(训练日志 alpha=4,评测照默认值传了 32),那批 `3bit+LoRA`
 参照数因此全部不可用。合并后的 `merge_info.json` 和分片 metadata 里会
@@ -502,25 +537,36 @@ TT_ROOT=<torchtitan-npu 目录> python3 verify/probe_lora_tree.py
 torchtitan root: /home/.../torchtitan-npu
 Python: 3.12.x
 torchtitan:     /home/.../third_party/torchtitan/torchtitan/__init__.py
+converter:      torchtitan-npu 的 lora.py 是已提交的原版(根配置写死为 DSv4) -> 用本仓库 qwen36_lora_compat 的兼容层
 ```
 
-通过的样子是"判据"段三条全 `OK`:
+`converter:` 那行在干净 clone 上就该是上面这样。没给 `TT_ROOT` 且两个包都已装进
+环境时,probe 用装好的那份,不再去猜目录。
 
-| 判据 | 含义 |
-|---|---|
-| 分组专家被 LoRA 覆盖 | 转换后 `routed_experts.inner_experts` 的 Config 类型变成了 GroupedLoRA* |
-| 命中数 == n_layers | 40 层每层都挂上了(`grouped=40`) |
-| dense 命中为 0 | `target_modules=()` 生效,LoRA 只加在路由专家上 |
+通过的样子是"判据"段九条全 `OK`(下面是 2026-11-16 的实跑输出):
 
-外加一行 adapter 参数量,应与 `E × r × (2·dim + 3·moe_inter)` 的解析值一致
-(rank16 全模型 0.92 G 参数)。
+| 判据 | 含义 | 实测 |
+|---|---|---|
+| 分组专家被 LoRA 覆盖 | 转换后 `inner_experts` 的配置类继承了 `LoRAOptions` | `grouped=40 / 40` |
+| 命中数 == 层数 | 40 层每层都挂上了 | `40 == 40` |
+| dense 命中为 0 | `target_modules=()` 生效,LoRA 只加在路由专家上 | `dense=0` |
+| converter 自己报的计数一致 | 截它那行日志对拍 | `dense=0 grouped=40 rank=16 expert_rank=16` |
+| 根配置带 lora 字段,且仍构造原模型类 | 兼容层派生的根配置没换掉模型 | `Qwen35Model` |
+| 实例化一层:adapter 参数名和形状 | `w13_lora_a` / `w1_lora_b` / `w3_lora_b` / `w2_lora_a` / `w2_lora_b` | 5 个张量 |
+| 实例化一层:adapter 参数量 | 等于 `E × r × (2·dim + 3·moe_inter)` | `23068672`(每层 23.07 M,全模型 0.923 G) |
+| 实例化一层:基座权重仍在 | `w1_EFD` / `w2_EDF` / `w3_EFD` | `[256,512,2048]` / `[256,2048,512]` / `[256,512,2048]` |
+| scaling == alpha / rank | | `2.0` |
+
+"是不是 LoRA 配置"按是否继承 `LoRAOptions` 判,**不按类名**:工厂生成的配置类叫
+`_make_lora_adapter_config_cls.<locals>.Config`,名字里没有大写的 LoRA。
 
 失败分两种,**含义完全不同**:
 
 | 现象 | 性质 | 怎么办 |
 |---|---|---|
-| 退出码 2,`!! 失败于 [import ...]` | **环境问题,不是结论** | 脚本会打出诊断:Python 版本 / third_party 是空的 / 路径没找到,并给出修法。修完重跑 |
-| 判据段出现 `X` | **结论为假** | LoRA 工厂挂不上 Qwen 的配置树。阶段 6/7 的排期作废,要改 converter 的树遍历 |
+| 退出码 2,`!! 失败于 [import ...]` | **环境问题,不是结论** | 脚本会打出诊断:Python 版本 / third_party 是空的 / 路径没找到 / 缺哪个包,并给出修法。修完重跑 |
+| 退出码 1,`!! 失败于 [model_registry(...)]` | **代码层面的结论** | import 已全过,是 converter 在 Qwen 的配置树上没走完。重装环境没用 |
+| 退出码 1,判据段出现 `X` | **结论为假** | 转换走完了但结果不对。阶段 6/7 的排期作废,要改 converter |
 
 **不要把第一种记成第二种。** import 期炸掉什么都没验到。
 
@@ -557,7 +603,8 @@ conda activate lqq-train && bash env/2_pip_train.sh
 | 1 | torch 装上且能 import | 直链被回收 |
 | 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
 | 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule);或 torchtitan-npu 没钉在 `3f9f99a`(报 `No module named 'attn_gym.…'`) |
-| 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑" |
+| 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑"。缺 `fla` / `triton` 会在它之前被拦下 |
+| 5 | 本仓库的训练配置能 import、能构造(`verify/probe_recipe_cpu.py`) | 缺 `torchvision`:训练入口 `torchtitan_npu.models.qwen3_5` 要它,闸门 4 的入口走不到 |
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
 真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令,留给卡空闲时跑。
@@ -599,6 +646,7 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
 | torch_npu | `2.14.0.dev20260808` |
 | triton-ascend | `3.2.1` |
 | fla-core | `0.5.2`(+ `einops`;Qwen 模型专用) |
+| torchvision | `0.29.0.dev20260720+cpu` cp312 aarch64(直链,`--no-deps`;它钉 `torch==2.14.0.dev20260719`)+ `pillow` |
 | numpy | `>=2.0,<2.3` |
 | attn-gym | `0.0.9` |
 | spmd_types | `0.2.3`(不是 0.3.0,torchtitan 0.3.0 钉的是这个) |
@@ -646,6 +694,11 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
   所以 triton-ascend 也是闸门 4 的前提,不再是"训练前补上就行"。它的索引连不上时
   直接下 wheel(约 188 MB):
   `https://repo.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl`
+* **训练入口还需要 `torchvision`,闸门 4 验不到。** `torchtitan_npu.models.qwen3_5`
+  一 import 就拉多模态数据管线(`hf_datasets/multimodal/utils/image.py` 顶层
+  `import torchvision.io`),只训文本也绕不开。版本要和 torch 成对:
+  `0.29.0.dev20260720`,nightly 索引页已经不列这个日期,但直链还在。
+  安装脚本的闸门 5 就是为这类"闸门 4 的入口走不到"的缺口加的。
 * **环境不要建在 `/dev/shm`。** 上一份训练环境就建在那里,随重启整个消失。
 * **CANN 版本决定融合算子可用性。** 9.0.1 缺 `aclnnMhcPost` / `aclnnSparseFlashMla`
   等符号,9.1.0 才有;而且 `libopapi.so` 在 ops 包里,只装 toolkit 验不出来。

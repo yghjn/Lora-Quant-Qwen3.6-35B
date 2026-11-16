@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 阶段 2(训练线):装包 + 过四道闸门。工单阶段 6(LoRA 训练)才需要。
+# 阶段 2(训练线):装包 + 过五道闸门。工单阶段 6(LoRA 训练)才需要。
 #
 #     conda activate lqq-train
 #     bash env/2_pip_train.sh
@@ -7,11 +7,12 @@
 # proxy 由你自己开关 —— 本脚本不碰任何 proxy 变量。
 # 本机的情况是:**这一步(pip / git)需要 proxy 关掉。**
 #
-# 四道闸门,每道失败都会打出下一步该查什么:
+# 五道闸门,每道失败都会打出下一步该查什么:
 #     GATE 1  torch           装上且能 import
 #     GATE 2  torch_npu       能 import(ABI 匹配 + CANN 能找到)—— 最容易炸
 #     GATE 3  torchtitan_npu  能 import(torch 版本够新)
 #     GATE 4  LoRA 配置树     分组专家 LoRA 能挂上 Qwen3.5-35B-A3B
+#     GATE 5  训练配置        本仓库的 qwen36_lora_recipe 能 import、能构造(到建模型之前)
 #
 # 全程不占 NPU:GATE 3/4 置空 ASCEND_RT_VISIBLE_DEVICES,纯 CPU。
 # 真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令。
@@ -353,8 +354,25 @@ pip_install \
     attn-gym==0.0.9 pybind11 "$NUMPY_SPEC" PyYAML ninja scipy==1.13.1 safetensors==0.8.0 \
     "spmd_types==0.2.3" torchdata tensorboard tyro blobfile tiktoken tomli_w tabulate \
     "datasets==4.7.0" tokenizers sentencepiece psutil wandb torch_checkpointing \
-    "fla-core==0.5.2" einops \
+    "fla-core==0.5.2" einops pillow requests \
     || die "其余依赖安装失败" "要换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
+# torchvision:训练入口 `torchtitan_npu.models.qwen3_5` 会 import 多模态数据管线
+# (torchtitan/hf_datasets/multimodal/utils/image.py 顶层 `import torchvision.io`),
+# 所以即使只训文本也要它。闸门 4 的入口是 upstream 的 `torchtitan.models.qwen3_5`,
+# 走不到这里 —— 2026-11-16 在全新环境里实跑训练配置才发现。
+# 版本照 torchtitan-npu@3f9f99a 的 requirements.txt:0.29.0.dev20260720,和 torch
+# dev20260719 成对。nightly 索引页上已经不列这个日期了,但直链还在(同 torch)。
+# --no-deps:它声明依赖一个确切的 torch 版本,让 pip 去解会动装好的 torch。
+TV_WANT="${TV_WANT:-0.29.0.dev20260720}"
+TV_WHL="${TV_WHL:-https://download.pytorch.org/whl/nightly/cpu/torchvision-0.29.0.dev20260720%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl}"
+HAVE_TV="$(pkg_ver torchvision)"
+if [ "${HAVE_TV#"$TV_WANT"}" != "$HAVE_TV" ]; then
+    echo "已装 torchvision $HAVE_TV,跳过下载。"
+else
+    [ -n "$HAVE_TV" ] && echo "当前装的是 torchvision $HAVE_TV,不是 $TV_WANT,下面会换掉它。"
+    "$P" -m pip install --no-deps "$TV_WHL" \
+        || echo "   (torchvision 装失败。和 torch 一样走 download.pytorch.org,连不上就手动下再 TV_WHL=<本地 .whl> 重跑;GATE 5 之前会拦住)"
+fi
 # 上面最后两个(fla-core / einops)是 Qwen 专属的:upstream torchtitan 的
 # models/qwen3_5/model.py 在模块顶层 `from fla.modules.conv.triton.ops import ...`,
 # 而 torchtitan 和 torchtitan-npu 的 requirements 都没列 —— 只有 qwen3_5/README.md
@@ -429,11 +447,35 @@ fi
 cpu_only env TT_ROOT="$TT_DIR" "$P" "$REPO_ROOT/verify/probe_lora_tree.py"
 RC=$?
 
+# ---------------------------------------------------------------- GATE 5
+say "6. 本仓库的训练配置能构造吗  (GATE 5)"
+echo "闸门 4 只验 converter。这一步验训练真正走的 import 链(MODULE=qwen36_lora_recipe),"
+echo "到建模型之前为止。纯 CPU,不加载权重。"
+echo "torchvision $(pkg_ver torchvision) / pillow $(pkg_ver pillow)"
+RC5=3
+if [ "$RC" -ne 0 ]; then
+    echo "GATE 4 没过,跳过 GATE 5。"
+elif [ -z "$(pkg_ver torchvision)" ]; then
+    echo "!! torchvision 没装上,GATE 5 没法跑。手动下这个 wheel(约 2 MB)再重跑:"
+    echo "     $TV_WHL"
+    echo "     TV_WHL=<下到本地的 .whl> bash env/2_pip_train.sh"
+else
+    cpu_only "$P" "$REPO_ROOT/verify/probe_recipe_cpu.py"
+    RC5=$?
+fi
+
 say "完成"
 echo "解释器: $P"
 echo "仓库:   $TT_DIR"
-[ "$RC" -eq 0 ] && echo "四道闸门全过。" \
-    || echo "GATE 4 未过(rc=$RC)—— 上面的输出会指出是 import 问题还是判据不成立。"
+if [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ]; then
+    echo "五道闸门全过。"
+else
+    [ "$RC" -ne 0 ] && echo "GATE 4 未过(rc=$RC):rc=2 是 import/环境问题,rc=1 是判据不成立。看上面的输出。"
+    [ "$RC" -eq 0 ] && echo "GATE 5 未过(rc=$RC5):rc=2 是 import/环境问题,rc=1 是判据不成立,rc=3 是没跑。"
+fi
+if [ -z "$(pkg_ver triton-ascend)" ]; then
+    echo "!! triton-ascend 没装上 —— 见 GATE 4 之前的说明。"
+fi
 cat <<NOTE
 
 下一步(需要一张空闲卡):5 步 dry run,确认真权重能加载。

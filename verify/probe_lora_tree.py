@@ -48,7 +48,10 @@
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import os
+import re
 import sys
 import traceback
 
@@ -76,10 +79,27 @@ def _wire_paths() -> str | None:
     cands = []
     if os.environ.get("TT_ROOT"):
         cands.append(os.environ["TT_ROOT"])
-    cands += [
-        os.path.expanduser("~/src/torchtitan-npu"),          # 2_pip_train.sh 的默认 TT_DIR
-        "/home/ma-user/work/l84414662/torchtitan-npu",       # 本机同事的 clone(只读)
-    ]
+    else:
+        # 没给 TT_ROOT 且两个包都已经装进当前环境:就用装好的,**不要再猜目录**。
+        # 以前这里不管装没装都往 sys.path 最前面塞猜到的目录,于是开发机上
+        # 同事那份(带未提交改动的)clone 会盖过环境里装好的干净 clone ——
+        # probe 验的就不是你实际会用来训练的那份代码了。
+        import importlib.util
+
+        try:
+            installed = all(
+                importlib.util.find_spec(m) is not None for m in ("torchtitan", "torchtitan_npu")
+            )
+        except (ImportError, ValueError):
+            installed = False
+        if installed:
+            spec = importlib.util.find_spec("torchtitan_npu")
+            origin = getattr(spec, "origin", None) or ""
+            return os.path.dirname(os.path.dirname(origin)) or "<已安装的包>"
+        cands += [
+            os.path.expanduser("~/src/torchtitan-npu"),          # 2_pip_train.sh 的默认 TT_DIR
+            "/home/ma-user/work/l84414662/torchtitan-npu",       # 开发机上同事的 clone(只读,带未提交改动)
+        ]
     for root in cands:
         up = os.path.join(root, "third_party", "torchtitan")
         if os.path.isdir(os.path.join(root, "torchtitan_npu")) and os.path.isdir(
@@ -192,6 +212,7 @@ def _env_hints(exc: BaseException | None = None) -> list[str]:
 
 
 def _fail(stage: str, exc: BaseException) -> None:
+    """import 期的失败:环境问题,退出码 2。"""
     print(f"\n!! 失败于 [{stage}]: {type(exc).__name__}: {exc}")
     traceback.print_exc()
     print("\n" + "-" * 60)
@@ -206,6 +227,30 @@ def _fail(stage: str, exc: BaseException) -> None:
     sys.exit(2)
 
 
+def _fail_real(stage: str, exc: BaseException, compat_line: str) -> None:
+    """import 全过之后、构造/转换配置树时的失败:**不是环境问题**,退出码 1。
+
+    以前这里也走 `_fail`,于是一个真正的结论(converter 在 Qwen 的配置树上
+    跑不下来)被报成"上面这些都是环境问题",退出码还是 2。
+    """
+    print(f"\n!! 失败于 [{stage}]: {type(exc).__name__}: {exc}")
+    traceback.print_exc()
+    print("\n" + "-" * 60)
+    print("   这一步 import 已经全部成功,所以**不是环境问题**。")
+    print("   是 converter 在 Qwen 的配置树上没走完 —— 代码层面的结论,重装环境没用。")
+    print(f"   当前:{compat_line}")
+    msg = str(exc)
+    if "_LoRAModelConfig" in msg and "missing" in msg:
+        print()
+        print("   这条具体是:convert() 的最后一行把根配置派生成写死的 DSv4 根配置类,")
+        print("   Qwen 的根配置没有那几个 DSv4 专有字段。前面的树遍历和 strict 校验都已")
+        print("   通过(否则走不到这一行)。本仓库 src/qwen36_lora_compat.py 就是为它写的")
+        print("   —— 如果看到这条,说明 probe 没走兼容层,请确认用的是最新的本仓库。")
+    print("-" * 60)
+    print("\n判定:本步**未通过**(退出码 1,结论性失败)。")
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------- imports
 if TT_ROOT_USED:
     print(f"torchtitan root: {TT_ROOT_USED}")
@@ -218,13 +263,27 @@ except BaseException as exc:  # noqa: BLE001
     _fail("import torchtitan.models.qwen3_5", exc)
 
 try:
-    from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter
+    from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter  # noqa: F401
 except BaseException as exc:  # noqa: BLE001
     _fail("import DeepSeekV4LoRAConverter", exc)
 
-import torchtitan as _tt  # noqa: E402  —— 只为打出解析到哪个 torchtitan
+# 本仓库的 src/:converter 走 qwen36_lora_compat(见该文件开头的说明)。
+# probe 必须和 qwen36_lora_recipe.py 用**同一个**入口,否则闸门过了、训练照样炸。
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+try:
+    import qwen36_lora_compat as _compat
+except BaseException as exc:  # noqa: BLE001
+    _fail("import qwen36_lora_compat(本仓库 src/)", exc)
 
-print(f"torchtitan:     {_tt.__file__}\n")
+import torchtitan as _tt  # noqa: E402  —— 只为打出解析到哪个 torchtitan
+from torchtitan.protocols.module import Module as _Module  # noqa: E402
+from torchtitan.tools.logging import logger as _tt_logger  # noqa: E402
+from torchtitan_npu.models.deepseek_v4.lora import LoRAOptions  # noqa: E402
+
+print(f"torchtitan:     {_tt.__file__}")
+print(f"converter:      {_compat.describe()}\n")
 
 
 # ------------------------------------------------------------ tree walk
@@ -245,7 +304,15 @@ def walk(cfg, path="model", depth=0, seen=None):
         for k, v in cfg.items():
             yield from walk(v, f"{path}[{k!r}]", depth + 1, seen)
         return
-    for name, value in list(getattr(cfg, "__dict__", {}).items()):
+    # torchtitan 的 Config 全是 @dataclass(slots=True),**没有 __dict__**。
+    # 以前这里只走 __dict__,结果整棵树一个子节点都遍历不到 ——
+    # "[转换前] inner_experts 节点数 = 0" 就是这么来的,转换后也会是 0,
+    # 判据会假阴性。dataclass 走 fields(),其余对象才退回 __dict__。
+    if dataclasses.is_dataclass(cfg) and not isinstance(cfg, type):
+        items = [(f.name, getattr(cfg, f.name, None)) for f in dataclasses.fields(cfg)]
+    else:
+        items = list(getattr(cfg, "__dict__", {}).items())
+    for name, value in items:
         if name.startswith("_"):
             continue
         if isinstance(value, (str, int, float, bool, type(None))):
@@ -269,7 +336,7 @@ def main() -> int:
     try:
         base = model_registry(FLAVOR)
     except BaseException as exc:  # noqa: BLE001
-        _fail(f"model_registry({FLAVOR}) 未加 converter", exc)
+        _fail_real(f"model_registry({FLAVOR}) 未加 converter", exc, _compat.describe())
 
     before = {}
     for path, cfg in walk(base.model):
@@ -280,48 +347,73 @@ def main() -> int:
         print(f"   {p}\n     -> {t}")
 
     # ---- 转换后 ----
-    conv = DeepSeekV4LoRAConverter.Config(
-        rank=RANK,
-        alpha=ALPHA,
-        rank_experts=RANK,
-        # 只加路由专家。dense 目标留空 —— 合并路径只覆盖路由专家,
-        # 加在 attention/router 上的 adapter 部署时用不上。
-        target_modules=(),
-    )
+    # converter 自己会打一行 "DeepSeek-V4 LoRA: dense=%d grouped=%d rank=%d ..."。
+    # 这是它**实际**替换了多少个节点的计数,比事后数树更权威,所以截下来当判据。
+    captured: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    cap = _Cap(level=logging.INFO)
+    prev_level = _tt_logger.level
+    _tt_logger.addHandler(cap)
+    if _tt_logger.getEffectiveLevel() > logging.INFO:
+        _tt_logger.setLevel(logging.INFO)
     try:
+        conv = _compat.lora_converter_config(
+            rank=RANK,
+            alpha=ALPHA,
+            rank_experts=RANK,
+            # 只加路由专家。dense 目标留空 —— 合并路径只覆盖路由专家,
+            # 加在 attention/router 上的 adapter 部署时用不上。
+            target_modules=(),
+        )
         spec = model_registry(FLAVOR, converters=[conv])
     except BaseException as exc:  # noqa: BLE001
-        _fail(f"model_registry({FLAVOR}, converters=[LoRA])", exc)
+        _fail_real(f"model_registry({FLAVOR}, converters=[LoRA])", exc, _compat.describe())
+    finally:
+        _tt_logger.removeHandler(cap)
+        _tt_logger.setLevel(prev_level)
+    root = spec.model
+    print(f"[转换后] 根配置类 = {describe(root)}")
+
+    # "这是不是一个 LoRA 配置"**不能**按类名里有没有 "LoRA" 判:工厂生成的配置类叫
+    # `_make_lora_adapter_config_cls.<locals>.Config`(小写 lora),而根配置
+    # `LoRAQwen35Model.Config` 和 `root.lora` 这个 converter 配置的名字里反而都带
+    # "LoRA"。以前就是这么判的,结果 grouped=0、dense=2,三条判据全是假阴性。
+    # 权威判据是配置类是否继承 `LoRAOptions`(rank / alpha / chunk_rows 那个 mixin)。
+    def is_lora_cfg(cfg) -> bool:
+        return isinstance(cfg, LoRAOptions)
 
     after = {}
-    lora_params = {}
-    for path, cfg in walk(spec.model):
-        t = describe(cfg)
-        if "inner_experts" in path and path.endswith("inner_experts"):
-            after[path] = t
-            if "LoRA" in t:
-                for attr in ("rank", "alpha", "num_experts", "dim", "hidden_dim"):
-                    if hasattr(cfg, attr):
-                        lora_params.setdefault(attr, getattr(cfg, attr))
-    grouped_hits = sum(1 for t in after.values() if "LoRA" in t)
-    dense_hits = sum(
-        1
-        for path, cfg in walk(spec.model)
-        if "LoRA" in describe(cfg) and "inner_experts" not in path
-    )
+    for path, cfg in walk(root):
+        if path.endswith("inner_experts"):
+            after[path] = cfg
+    grouped_cfgs = [c for c in after.values() if is_lora_cfg(c)]
+    grouped_hits = len(grouped_cfgs)
+    all_lora = [fqn for fqn, cfg, _p, _a in root.traverse(_Module.Config, recurse=True) if is_lora_cfg(cfg)]
+    dense_fqns = [fqn for fqn in all_lora if not fqn.endswith("inner_experts")]
+    dense_hits = len(dense_fqns)
 
-    print(f"\n[转换后] inner_experts 节点数 = {len(after)}")
-    for p, t in list(after.items())[:2]:
-        print(f"   {p}\n     -> {t}")
+    print(f"[转换后] inner_experts 节点数 = {len(after)}")
+    for path, c in list(after.items())[:2]:
+        owner = getattr(type(c), "_owner", None)
+        print(f"   {path}\n     -> {describe(c)}\n        构造的模块类: {getattr(owner, '__name__', owner)}")
 
-    n_layers = getattr(spec.model, "n_layers", None)
+    layers = getattr(root, "layers", None)
+    n_layers = len(layers) if isinstance(layers, (list, tuple)) else getattr(root, "n_layers", None)
+    lora_line = next((msg for msg in captured if "LoRA:" in msg and "grouped=" in msg), None)
+    hit = re.search(r"dense=(\d+)\s+grouped=(\d+)\s+rank=(\d+)\s+expert_rank=(\d+)", lora_line or "")
+    print(f"\nconverter 自己的计数: {lora_line or '<没截到那行日志>'}")
+
     print("\n================ 判据 ================")
     ok = True
 
     def check(name: str, cond: bool, detail: str) -> None:
         nonlocal ok
         print(f"  {'OK ' if cond else 'X  '} {name}: {detail}")
-        ok = ok and cond
+        ok = ok and bool(cond)
 
     check(
         "分组专家被 LoRA 覆盖",
@@ -329,34 +421,85 @@ def main() -> int:
         f"grouped={grouped_hits} / inner_experts 节点 {len(after)}",
     )
     check(
-        "命中数 == n_layers",
-        n_layers is not None and grouped_hits == n_layers,
-        f"grouped={grouped_hits}  n_layers={n_layers}",
+        "命中数 == 层数",
+        n_layers is not None and grouped_hits == n_layers == len(after),
+        f"grouped={grouped_hits}  层数={n_layers}",
     )
     check(
         "dense 命中为 0(target_modules=())",
         dense_hits == 0,
-        f"dense={dense_hits}",
+        f"dense={dense_hits}" + (f"  例: {dense_fqns[:3]}" if dense_hits else ""),
+    )
+    check(
+        "converter 自己报的计数一致",
+        hit is not None
+        and int(hit.group(1)) == 0
+        and int(hit.group(2)) == grouped_hits
+        and int(hit.group(4)) == RANK,
+        (
+            f"dense={hit.group(1)} grouped={hit.group(2)} expert_rank={hit.group(4)}"
+            if hit
+            else "没截到 'dense=.. grouped=..' 那行"
+        ),
+    )
+    base_owner = getattr(type(base.model), "_owner", None)
+    root_owner = getattr(type(root), "_owner", None)
+    check(
+        "根配置带 lora 字段,且仍构造原模型类",
+        hasattr(root, "lora") and isinstance(root, type(base.model)) and root_owner is base_owner and root_owner is not None,
+        f"lora 字段={hasattr(root, 'lora')}  构造的模型类={getattr(root_owner, '__name__', None)}",
     )
 
-    if lora_params:
-        print(f"\n  adapter 配置: {lora_params}")
-        E = lora_params.get("num_experts")
-        D = lora_params.get("dim")
-        F = lora_params.get("hidden_dim")
-        if None not in (E, D, F) and n_layers:
-            per_layer = E * RANK * (2 * D + 3 * F)
-            total = per_layer * n_layers
-            print(
-                f"  解析式 E×r×(2·dim+3·moe_inter) = {E}×{RANK}×(2×{D}+3×{F})"
-                f" = {per_layer / 1e6:.2f} M/层"
+    # ---- 真的实例化一层,核对 adapter 的参数名和参数量 ----
+    # 静态看配置说明不了模块能不能建出来。build() 里是 torch.empty,不会真占满内存。
+    if grouped_cfgs:
+        c0 = grouped_cfgs[0]
+        E, D, F, r = c0.num_experts, c0.dim, c0.hidden_dim, c0.rank
+        analytic = E * r * (2 * D + 3 * F)
+        try:
+            mod = c0.build()
+            shapes = {n: tuple(p.shape) for n, p in mod.named_parameters()}
+            lora_n = sum(p.numel() for n, p in mod.named_parameters() if "lora_" in n)
+            want = {
+                "w13_lora_a": (E, r, D),
+                "w1_lora_b": (E, F, r),
+                "w3_lora_b": (E, F, r),
+                "w2_lora_a": (E, r, F),
+                "w2_lora_b": (E, D, r),
+            }
+            got = {k: shapes.get(k) for k in want}
+            check(
+                "实例化一层:adapter 参数名和形状",
+                got == want,
+                f"{len(want)} 个 adapter 张量" if got == want else f"期望 {want}  实际 {got}",
             )
+            check(
+                "实例化一层:adapter 参数量 == E×r×(2·dim+3·moe_inter)",
+                lora_n == analytic,
+                f"{lora_n} vs 解析值 {E}×{r}×(2×{D}+3×{F}) = {analytic}",
+            )
+            check(
+                "实例化一层:基座权重仍在",
+                all(k in shapes for k in ("w1_EFD", "w2_EDF", "w3_EFD")),
+                f"w1_EFD={shapes.get('w1_EFD')}  w2_EDF={shapes.get('w2_EDF')}  w3_EFD={shapes.get('w3_EFD')}",
+            )
+            scaling = getattr(mod, "_lora_scaling", None)
+            check(
+                "scaling == alpha / rank",
+                scaling is not None and abs(scaling - ALPHA / RANK) < 1e-9,
+                f"{scaling} vs {ALPHA}/{RANK} = {ALPHA / RANK}",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            traceback.print_exc()
+            check("实例化一层", False, f"{type(exc).__name__}: {exc}")
+        if n_layers:
+            total = analytic * n_layers
             print(
-                f"  全模型 adapter = {total / 1e9:.3f} G 参数"
-                f" = {total * 2 / 2**30:.2f} GiB (bf16)"
+                f"\n  每层 adapter = {analytic / 1e6:.2f} M 参数;"
+                f"全模型 = {total / 1e9:.3f} G 参数 = {total * 2 / 2**30:.2f} GiB (bf16)"
             )
 
-    print("\n结论:" + ("本步通过。" if ok else "本步未通过。"))
+    print("\n结论:" + ("本步通过。" if ok else "本步未通过(退出码 1:判据不成立,不是环境问题)。"))
     return 0 if ok else 1
 
 

@@ -1,0 +1,120 @@
+"""周期性保存 LoRA adapter(工单 §6.5)。本仓库自带,不依赖 torchtitan-npu 里的任何文件。
+
+为什么自带
+----------
+`qwen36_lora_recipe.py` 原先 import 的是
+`torchtitan_npu.patches.torchtitan.models.common.adapter_save`。那个文件只存在于
+同事 `l84414662` 的工作区里,**是未跟踪文件,从来没提交过** —— 一份干净的
+torchtitan-npu clone 里没有它。后果是训练能正常启动、加载完 70 GB 权重、建好
+优化器,然后在 `post_optimizer_build_fn` 里 `ModuleNotFoundError`。
+(2026-11-16 逐条核对本仓库的 import 时发现;闸门 0.1 走不到这一步,不会报。)
+
+落盘格式和那个文件**保持一致**,因为 `src/merge_lora.py` 是照它读的:
+
+* 文件名 `adapter_r<rank:02d>_step<step:06d>.safetensors`,每个 rank 写自己那片,
+  不做 all-gather(专家 adapter 按 EP 分片,rank r 持有自己那段专家);
+* 张量只收名字里带 `lora_` 的参数,转 bf16;
+* metadata:`step`、`rank`,以及每个 DTensor 参数的
+  `<name>.global_shape`(逗号分隔)和 `<name>.placements`。
+
+环境变量:
+    ADAPTER_SAVE_DIR     输出目录。不设则不注册,`register_adapter_saver` 返回 False
+                         (recipe 里把这个 False 升级成了异常:训完没存等于白训)
+    ADAPTER_SAVE_EVERY   每多少步存一次,默认 100
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["register_adapter_saver", "save_adapters", "shard_name"]
+
+
+def shard_name(rank: int, step: int) -> str:
+    return f"adapter_r{rank:02d}_step{step:06d}.safetensors"
+
+
+def _rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _local(p: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """(本 rank 持有的那片, 是否 DTensor)。"""
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:  # 极老的 torch
+        return p, False
+    if isinstance(p, DTensor):
+        return p.to_local(), True
+    return p, False
+
+
+@torch.no_grad()
+def save_adapters(model_parts, out_dir: str, step: int) -> int:
+    """把本 rank 的 lora_* 参数写成一个 safetensors。返回写了多少个张量。"""
+    from safetensors.torch import save_file
+
+    os.makedirs(out_dir, exist_ok=True)
+    rank = _rank()
+    tensors: dict[str, torch.Tensor] = {}
+    meta: dict[str, str] = {"step": str(step), "rank": str(rank)}
+    for part in model_parts:
+        for name, p in part.named_parameters():
+            if "lora_" not in name:
+                continue
+            local, is_dtensor = _local(p)
+            tensors[name] = local.detach().to(torch.bfloat16).cpu().contiguous()
+            if is_dtensor:
+                meta[name + ".global_shape"] = ",".join(str(x) for x in p.shape)
+                meta[name + ".placements"] = str(p.placements)
+    if not tensors:
+        return 0
+    path = os.path.join(out_dir, shard_name(rank, step))
+    save_file(tensors, path, metadata=meta)
+    if rank == 0:
+        nbytes = sum(t.numel() * t.element_size() for t in tensors.values())
+        logger.info(
+            "adapter 已保存: step %d, %d 个张量, 本 rank %.1f MiB -> %s",
+            step, len(tensors), nbytes / 2**20, path,
+        )
+    return len(tensors)
+
+
+def register_adapter_saver(optimizers, model_parts) -> bool:
+    """在优化器的 post-step 钩子上挂周期保存。返回是否挂上了。
+
+    只挂**第一个**支持 `register_step_post_hook` 的优化器:每个优化器的 step 都会
+    触发钩子,挂多个会让计数变成真实步数的倍数。
+    """
+    out_dir = os.environ.get("ADAPTER_SAVE_DIR")
+    if not out_dir:
+        logger.warning("ADAPTER_SAVE_DIR 未设置 —— adapter 不会被保存")
+        return False
+    every = int(os.environ.get("ADAPTER_SAVE_EVERY", "100"))
+    if every <= 0:
+        raise ValueError(f"ADAPTER_SAVE_EVERY 必须是正整数,得到 {every}")
+    state = {"step": 0}
+
+    def _hook(*_args, **_kwargs):
+        state["step"] += 1
+        if state["step"] % every == 0:
+            save_adapters(model_parts, out_dir, state["step"])
+
+    opts = list(optimizers)
+    for opt in opts:
+        if hasattr(opt, "register_step_post_hook"):
+            opt.register_step_post_hook(_hook)
+            logger.info(
+                "adapter 保存已注册: 每 %d 步 -> %s(挂在 %s 上;共 %d 个优化器,只挂一个)",
+                every, out_dir, type(opt).__name__, len(opts),
+            )
+            return True
+    logger.warning("没有优化器支持 register_step_post_hook —— adapter 不会被保存")
+    return False

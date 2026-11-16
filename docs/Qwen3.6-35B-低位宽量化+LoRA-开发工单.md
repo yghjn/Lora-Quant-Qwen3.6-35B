@@ -279,7 +279,7 @@ DSv4.1:  W_deploy = quant_int8( dequant(W_nbit) + (alpha/rank)·B·A )
 
 | # | 事 | 验收 |
 |---|---|---|
-| 0.1 | 验证 `LoRAConverter` 能在 Qwen3.5-35B-A3B 的配置树上挂住分组专家 LoRA。**不需要权重、不需要卡**,构造配置树即可。**但需要 Python >= 3.12 且两个仓库都装上**,见下 | 转换后的配置树里 `routed_experts.inner_experts` 的 config 类型是 `GroupedLoRAExperts.Config`;打印的 LoRA 行形如 `dense=0 grouped=40` |
+| 0.1 | 验证 `LoRAConverter` 能在 Qwen3.5-35B-A3B 的配置树上挂住分组专家 LoRA。**不需要权重、不需要卡**,构造配置树即可。**但需要 Python >= 3.12 且两个仓库都装上**,见下 | 转换后的配置树里 `routed_experts.inner_experts` 的 config 类型是 `GroupedLoRAExperts.Config`;打印的 LoRA 行形如 `dense=0 grouped=40`。**2026-11-16 通过**(见下"0.1 的结果") |
 | 0.2 | 下 Qwen3.6-35B-A3B 权重,逐文件 Sha256 校验 | 校验全对,条数记录在案 |
 | 0.3 | 用真 config 替换 `qwen36/fixtures/qwen36-35b-a3b/config.json` 重跑形状预检 | 退出码 0,"形状预检:全过" |
 | 0.4 | 上游 `qwen3_5` 的 `35B-A3B` flavor 做 5 步训练 dry run,HF 格式初始加载 | `exit=0`,loss 有限且非 NaN,**无** "保持随机初始化" 类告警 |
@@ -305,7 +305,26 @@ KPBot 一条),`pip install -e` 也把它排除在外。所以 clone + 装插件�
 import 失败时把真因和修法打出来。完整流程在 README 的"§0.1 闸门怎么跑"。
 
 **判读:import 期失败(退出码 2)是环境问题,不是 0.1 的结论。**
-只有"判据"段出现 `X` 才说明 LoRA 挂不上。
+只有"判据"段出现 `X`、或 import 全过之后在 `model_registry(...)` 里抛异常
+(退出码 1),才说明 LoRA 挂不上。
+
+**0.1 的结果(2026-11-16)。** 通过,但暴露了本工单的一个前提错误。
+
+* 实跑环境:开发机上一个全新的 Python 3.12 环境,`env/2_pip_train.sh` 原样装,
+  torchtitan-npu 是**干净的** `3f9f99a`。九条判据全 OK:converter 自报
+  `dense=0 grouped=40 rank=16 expert_rank=16`;`inner_experts` 的配置类继承
+  `LoRAOptions`、构造的模块类是 `LoRA_ClampGroupedExperts`;实例化一层得到 5 个
+  adapter 张量共 23,068,672 参数 = `256×16×(2×2048+3×512)`,全模型 0.923 G。
+* **前提错误**:本工单是照 `l84414662` 的**工作区**核的,不是照已提交的代码。
+  干净 clone 上 `DeepSeekV4LoRAConverter.convert()` 的最后一行会
+  `derive(root, _LoRAModelConfig, ...)`,而 `_LoRAModelConfig` 写死继承
+  `DeepSeekV4Model.Config`,Qwen 的根配置没有 `hc_head` 等四个字段,TypeError。
+  同事工作区里这处已改成按 `type(root)` 派生,但没提交。另外 §6.5 依赖的
+  `adapter_save.py` 是工作区里的未跟踪文件。两处都改为由本仓库自带
+  (`src/qwen36_lora_compat.py`、`src/qwen36_adapter_save.py`),不改 torchtitan-npu。
+* G.2 的问题(树遍历能否找到 `GroupedExperts.Config`)答案是**能**:TypeError 出在
+  遍历、匹配、strict 校验全部通过之后。
+* 0.1 没验到的:真权重加载、前向/反传、分布式切分。那是 0.4 和 1.3 的事。
 
 **0.1 和 0.4 是整条链的闸门**:flavor 加载不了真权重,后面全部排期作废。
 先做它们,不要先写量化器。
@@ -596,7 +615,7 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 | # | 要确认什么 | 怎么确认 | 不成立的后果 |
 |---|---|---|---|
 | G.1 | 上游 `_35b_a3b` 注释写 "with vision encoder",vocab 248320。Qwen3.6-35B-A3B 的真实 vocab 和是否带 ViT 要核 | 读真 config.json;看 `qwen3_5/state_dict_adapter.py` 的键映射 | 要么找纯文本 flavor,要么自己加一个 |
-| G.2 | `LoRAConverter` 的配置树遍历能否在 Qwen 的层结构下找到 `GroupedExperts.Config` | §0.1,纯 CPU | 要改 converter 的树遍历 |
+| G.2 | `LoRAConverter` 的配置树遍历能否在 Qwen 的层结构下找到 `GroupedExperts.Config` | §0.1,纯 CPU。**2026-11-16 已确认:能**,40 层全命中 | 要改 converter 的树遍历 |
 | G.3 | HF checkpoint 里专家权重是融合 `[gate;up]` 还是分开的 `gate_proj`/`up_proj`/`down_proj` | 读一个分片的键名 | 决定 `offline_ptq` 和 `merge_lora` 的切分逻辑 |
 | G.4 | Qwen3.6 的实际推理长度(定 `TRACE_MAXTOK`) | 生成 50 条看 `reasoning_tokens` 的中位和 p75 | 截断比例过高,语料质量塌 |
 
@@ -634,4 +653,6 @@ ChatDataLoader 里。`src/prepare_corpus.py` 的作用因此是"第一步就炸,
 ---
 
 *本工单基于 2026-11-04 对 `l84414662` 工作区的只读调查。
+**那个工作区带未提交的改动**,所以文中标 [已验证] 的行号和行为对应的是工作区,
+不一定对应已提交的 `3f9f99a`。已知的差异见阶段 0"0.1 的结果"。
 标 [已验证] 的均注明了文件与行号;标 [假设] 的开工前必须先打正控。*
