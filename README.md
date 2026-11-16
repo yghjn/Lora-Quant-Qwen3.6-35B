@@ -437,6 +437,19 @@ MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
 | `Finished loading the checkpoint in N seconds.` | 加载完成 |
 | `No checkpoint was provided, this is a fresh start.` | **没加载,基座是随机的** —— 立刻停 |
 
+**语料的形状(2026-11-16 用真的 Qwen3.6 模板核对)。** 上游 `ChatDataset` 只收单轮
+`[user, assistant]`,多轮或带 system 的样本会在第一个 batch 抛 `ValueError`。
+`prepare_corpus.py` 现在用和上游**逐项相同**的 jinja 环境渲染,并提前拦掉不合形状的
+样本(原先用的是严格模式,会在模板的 `{%- if tools ... %}` 上误报
+`'tools' is undefined`,而训练本身并不会)。
+
+模板若带 `{%- generation %}` 标签(Hub 上较新的版本有),上游的 jinja 环境不认,
+训练建 tokenizer 时会报 `TemplateSyntaxError`;`prepare_corpus.py` 会先报出来并说明处理办法。
+
+**未决**:用 Qwen3.6 的模板渲出来,prompt 段到 `<|im_start|>assistant\n<think>\n` 为止,
+算 loss 的部分是 `\n</think>\n\n<回答><|im_end|>` —— 即**每条样本都在教模型输出一个空的
+思考块**。冒烟无所谓;交付训练前要确认这和评测时的思考开关是否一致。
+
 `MODULE=qwen36_lora_recipe` 不是 `torchtitan_npu.models.qwen3_5` —— 那个模块的
 全部名字都被搬进了我们这个模块,所以它是**超集**,而 torchtitan-npu 的
 clone 一个文件都不用改。在一份**干净的** clone 上这句话要靠本仓库的

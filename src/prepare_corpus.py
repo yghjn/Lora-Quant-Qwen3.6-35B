@@ -106,14 +106,92 @@ def _config_has_template(tokenizer_dir: str) -> bool:
     return False
 
 
-def render_check(template: str, messages: list[dict]) -> str:
-    """用 jinja2 渲一遍。上游 set_chat_template 也是 ``env.from_string(template)``。"""
+_COMPILED: dict[str, object] = {}
+
+
+def _compile(template: str):
+    """按上游 ``BaseTokenizer.set_chat_template`` 的方式编译模板 —— **逐项照抄**。
+
+    出处:``torchtitan/components/tokenizer.py:43-78``(upstream 086bf6c16)。
+    这里验的是"训练时会不会炸",所以环境必须和训练时一样,不能更严也不能更松:
+
+    * ``ImmutableSandboxedEnvironment``,``trim_blocks`` / ``lstrip_blocks`` 都开,
+      扩展只有 ``loopcontrols``;
+    * **默认的 Undefined(宽松)**。2026-11-16 以前这里用的是 ``StrictUndefined``,
+      于是 Qwen3.6 模板里的 ``{%- if tools ... %}`` 在没传 ``tools`` 时直接
+      ``UndefinedError`` —— 训练根本不会这样,是这个检查自己比训练严;
+    * 全局函数 ``raise_exception`` / ``strftime_now``,过滤器 ``tojson``。
+
+    模板编译不过就退出。最常见的原因见下面的报错说明。
+    """
+    if template in _COMPILED:
+        return _COMPILED[template]
     try:
-        from jinja2 import Environment, StrictUndefined
+        import jinja2
+        import jinja2.ext
+        import jinja2.sandbox
     except ImportError:
         _die("缺 jinja2。", "它是 torch 的依赖,两个 env 里都该有:pip install jinja2")
-    env = Environment(undefined=StrictUndefined, keep_trailing_newline=True)
-    return env.from_string(template).render(messages=messages)
+
+    def raise_exception(msg):
+        raise jinja2.exceptions.TemplateError(msg)
+
+    def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+        return json.dumps(
+            x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys
+        )
+
+    def strftime_now(fmt):
+        from datetime import datetime
+
+        return datetime.now().strftime(fmt)
+
+    env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+        trim_blocks=True,
+        lstrip_blocks=True,
+        extensions=[jinja2.ext.loopcontrols],
+    )
+    env.globals["raise_exception"] = raise_exception
+    env.globals["strftime_now"] = strftime_now
+    env.filters["tojson"] = tojson
+    try:
+        compiled = env.from_string(template)
+    except jinja2.exceptions.TemplateSyntaxError as exc:
+        lines = [
+            f"第 {exc.lineno} 行: {exc.message}",
+            "训练时上游建 tokenizer 用的是同一套 jinja 环境,会在同一处报同样的错。",
+        ]
+        if "generation" in str(exc.message):
+            lines += [
+                "模板里有 `{%- generation %}` / `{%- endgeneration %}`:这是 HF transformers 专用的",
+                "标签(只用来标 assistant 段,不产生任何文本),上游 torchtitan 的 jinja 环境不认。",
+                "Hub 上较新版本的 Qwen3.6 模板带这两行,较早的版本没有。",
+                "处理:在一份**可写的** checkpoint 目录副本里把这两行删掉(权重分片可以用软链接)。",
+            ]
+        _die("chat template 编译不过。", *lines)
+    _COMPILED[template] = compiled
+    return compiled
+
+
+def render_check(template: str, messages: list[dict], **kwargs) -> str:
+    """渲一遍。和上游 ``apply_chat_template`` 一样:``render(messages=..., **kwargs)``。"""
+    return _compile(template).render(messages=messages, **kwargs)
+
+
+def single_turn_problem(messages: list[dict]) -> str | None:
+    """上游 ChatDataset 只收单轮 ``[user, assistant]``,这里提前拦。
+
+    出处:``hf_datasets/text_datasets.py`` 的 ``_validate_messages``(upstream
+    086bf6c16),不满足时在**第一个 batch** 抛 ValueError —— 那时 8 卡已经加载完了。
+    返回 None 表示没问题,否则返回原因。
+    """
+    if len(messages) != 2:
+        return f"要恰好 2 条消息(一问一答),现在是 {len(messages)} 条"
+    if messages[0]["role"] != "user":
+        return f"第 1 条必须是 user,现在是 {messages[0]['role']!r}"
+    if messages[1]["role"] != "assistant":
+        return f"第 2 条必须是 assistant,现在是 {messages[1]['role']!r}"
+    return None
 
 
 # ---------------------------------------------------------------- 归一化
@@ -209,6 +287,18 @@ def main() -> int:
     print("-" * 60)
     print(rendered[:400])
     print("-" * 60)
+
+    # 上游用"只渲 user 那一条 + add_generation_prompt=True"的 token 数来定 loss 从哪
+    # 开始算(text_datasets.py 的 _tokenize_sample)。它应当是整段的前缀;不是的话
+    # 边界会偏几个 token。只提示,不拦 —— 上游自己也只按 token 数切。
+    prompt = render_check(template, probe[:1], add_generation_prompt=True)
+    tail = rendered[len(prompt):] if rendered.startswith(prompt) else None
+    if tail is None:
+        print("注意: prompt 段不是整段的前缀 —— loss 的起点会偏。把上面的样例和下面这段对一下:")
+        print(repr(prompt[-200:]))
+    else:
+        print(f"prompt 段到这里为止(之前的不算 loss): ...{prompt[-40:]!r}")
+        print(f"算 loss 的部分(模型要学着生成的): {tail.rstrip(chr(10))!r}")
     if "一加一等于几?" not in rendered or "二。" not in rendered:
         _die(
             "渲染结果里找不到输入内容 —— 模板没把 messages 放进去。",
@@ -224,6 +314,7 @@ def main() -> int:
     kept: list[list[dict]] = []
     bad = 0
     too_long = 0
+    not_single = 0
     seen = 0
     for path in args.src:
         if not os.path.isfile(path):
@@ -233,6 +324,12 @@ def main() -> int:
             msgs = normalize(sample)
             if msgs is None:
                 bad += 1
+                continue
+            why = single_turn_problem(msgs)
+            if why is not None:
+                if not_single == 0:
+                    print(f"第一条不是单轮问答的样本(第 {seen} 条): {why}")
+                not_single += 1
                 continue
             if args.max_chars and sum(len(m["content"]) for m in msgs) > args.max_chars:
                 too_long += 1
@@ -249,6 +346,14 @@ def main() -> int:
         _die(
             f"{bad}/{seen} 条样本认不出形状。",
             "支持的形状:messages / conversations / prompt+response / instruction+input+output。",
+            "确认要丢掉它们就加 --skip-bad。",
+        )
+
+    if not_single and not args.skip_bad:
+        _die(
+            f"{not_single}/{seen} 条样本不是单轮 [user, assistant]。",
+            "上游 ChatDataset 只收这一种形状(text_datasets.py 的 _validate_messages),",
+            "多轮对话、带 system 的样本会在第一个 batch 抛 ValueError。",
             "确认要丢掉它们就加 --skip-bad。",
         )
 
@@ -280,6 +385,7 @@ def main() -> int:
 
     print(f"读入:        {seen}")
     print(f"认不出:      {bad}" + ("  (已跳过)" if args.skip_bad else ""))
+    print(f"不是单轮:    {not_single}" + ("  (已跳过)" if args.skip_bad and not_single else ""))
     print(f"超长丢弃:    {too_long}")
     print(f"内置补充:    {args.synthetic}")
     print(f"写出:        {len(kept)}  -> {args.out}")
