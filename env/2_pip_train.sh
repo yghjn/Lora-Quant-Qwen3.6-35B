@@ -15,7 +15,7 @@
 #     GATE 5  训练配置        本仓库的 qwen36_lora_recipe 能 import、能构造(到建模型之前)
 #
 # 全程不占 NPU:GATE 3/4 置空 ASCEND_RT_VISIBLE_DEVICES,纯 CPU。
-# 真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令。
+# 真正上卡的 5 步 dry run 是脚本最后单独给出的几条命令(要 8 张卡)。
 set -uo pipefail
 
 TT_DIR="${TT_DIR:-$HOME/src/torchtitan-npu}"
@@ -478,12 +478,29 @@ if [ -z "$(pkg_ver triton-ascend)" ]; then
 fi
 cat <<NOTE
 
-下一步(需要一张空闲卡):5 步 dry run,确认真权重能加载。
+下一步(需要 8 张空闲卡):5 步 dry run,确认真权重能加载、adapter 能落盘。
+用的是本仓库自己的配置(MODULE=qwen36_lora_recipe)。下面所有路径都要绝对路径。
+
+    CKPT=<Qwen3.6-35B-A3B 的 HF 格式 checkpoint 目录>
+    WORK=<一个放语料和 adapter 的目录>
+
+    export PYTHONPATH=$REPO_ROOT/src:\$PYTHONPATH
+    $P $REPO_ROOT/src/prepare_corpus.py --tokenizer \$CKPT --synthetic 64 --out \$WORK/smoke.jsonl
+
     cd $TT_DIR
     export ASCEND_SET_ENV_PATH=$SET_ENV
-    NGPU=1 MODULE=torchtitan_npu.models.qwen3_5 CONFIG=qwen35_27b_4k_sft \\
-      HF_ASSETS_PATH=<tokenizer 目录> CKPT_SAVE_LOAD_PATH=<一个空目录> \\
-      bash scripts/run_train.sh --training.steps 5 --optimizer.name AdamW --compile.no-enable
+    NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_smoke \\
+      HF_ASSETS_PATH=\$CKPT DATA_FILES=\$WORK/smoke.jsonl \\
+      ADAPTER_SAVE_DIR=\$WORK/adapter ADAPTER_SAVE_EVERY=5 \\
+      bash scripts/run_train.sh --training.steps 5
+
+\$CKPT 一个目录管三件事:tokenizer(tokenizer.json / tokenizer_config.json)、
+权重索引(model.safetensors.index.json)、权重分片。没有单独的 tokenizer 目录。
+
+启动后先看日志:
+    Loading HF safetensors from --model.hf_assets_path: ...   开始加载真权重
+    Finished loading the checkpoint in ...                    加载完成
+    No checkpoint was provided, this is a fresh start.        没加载,基座是随机的 —— 立刻停
 
 注意 scripts/run_train.sh 直接调 torchrun。确认 PATH 上第一个 torchrun 来自
 本环境($(dirname "$P")),否则会用到别的 torch。

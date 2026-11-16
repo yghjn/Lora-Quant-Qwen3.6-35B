@@ -18,7 +18,13 @@
 2. 三个配置函数都能构造出 `Trainer.Config`;
 3. 每个配置的 40 层路由专家都是 LoRA 配置,rank / alpha 与配置名一致;
 4. adapter 落盘钩子能解析到本仓库的 `qwen36_adapter_save`
-   (没设 `ADAPTER_SAVE_DIR` 时抛 RuntimeError,而不是 ModuleNotFoundError)。
+   (没设 `ADAPTER_SAVE_DIR` 时抛 RuntimeError,而不是 ModuleNotFoundError);
+5. **基座权重会被加载**:`checkpoint.enable` / `initial_load_in_hf` 为真,
+   `hf_assets_path` 等于 `HF_ASSETS_PATH`,且 `load_only` 为真(不存全模型)。
+   上游这个开关默认是关的,关着的时候训练照样 exit 0,只是基座是随机的;
+6. NPU 的 GDN kernel override 在 `override.imports` 里,并且那个名字真的存在;
+7. 把训练启动器的参数解析原样走一遍:`--training.steps 5` 生效,
+   前面几条在解析之后仍然成立。
 
 退出码:0 通过;1 判据不成立;2 import 期失败(环境问题)。
 """
@@ -30,9 +36,11 @@ import sys
 import traceback
 
 os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", "")
-# 构造配置不读这两个,但 recipe / 上游的配置函数可能在缺省时告警,给个占位值
-os.environ.setdefault("HF_ASSETS_PATH", "/nonexistent-tokenizer-dir")
-os.environ.setdefault("DATA_FILES", "/nonexistent-corpus.jsonl")
+# recipe 构造配置时就读这两个(缺了直接抛)。这里只验配置,固定用占位值 ——
+# 不用 setdefault:shell 里若已 export 了真路径,判据里比对的值就不确定了。
+os.environ["HF_ASSETS_PATH"] = "/nonexistent-hf-assets-dir"
+os.environ["DATA_FILES"] = "/nonexistent-corpus.jsonl"
+os.environ.pop("INITIAL_LOAD_PATH", None)
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 if _SRC not in sys.path:
@@ -122,6 +130,16 @@ for fn, (rank, alpha) in EXPECT.items():
     check("parallelize_fn 是带冻结的那个", getattr(spec.parallelize_fn, "__name__", "") == "_parallelize_lora",
           str(getattr(spec.parallelize_fn, "__name__", spec.parallelize_fn)))
     check("挂了 adapter 落盘钩子", getattr(spec, "post_optimizer_build_fn", None) is not None)
+    ck = cfg.checkpoint
+    check("基座权重会被加载(checkpoint.enable + initial_load_in_hf)",
+          ck.enable is True and ck.initial_load_in_hf is True and ck.initial_load_model_only is True,
+          f"enable={ck.enable} initial_load_in_hf={ck.initial_load_in_hf}")
+    check("权重和 tokenizer 来自 HF_ASSETS_PATH",
+          cfg.hf_assets_path == os.environ["HF_ASSETS_PATH"] and ck.initial_load_path is None,
+          f"hf_assets_path={cfg.hf_assets_path} initial_load_path={ck.initial_load_path}")
+    check("不保存全模型(load_only)", ck.load_only is True, f"load_only={ck.load_only}")
+    check("NPU GDN override 在 override.imports 里", R.NPU_GDN_OVERRIDE in list(cfg.override.imports),
+          str(list(cfg.override.imports)))
 
 print("\n== adapter 落盘钩子的 import 路径")
 if last is not None:
@@ -138,6 +156,74 @@ if last is not None:
             os.environ["ADAPTER_SAVE_DIR"] = saved
 else:
     check("至少有一个配置构造成功", False)
+
+print("\n== 权重路径的环境变量")
+_SMOKE = "qwen36_35b_a3b_lora_smoke"
+_PLACEHOLDER = os.environ["HF_ASSETS_PATH"]
+
+
+def _raises(value: str | None, want: str) -> tuple[bool, str]:
+    if value is None:
+        os.environ.pop("HF_ASSETS_PATH", None)
+    else:
+        os.environ["HF_ASSETS_PATH"] = value
+    try:
+        getattr(R, _SMOKE)()
+        return False, "没抛异常"
+    except RuntimeError as exc:
+        return want in str(exc), str(exc)[:46]
+    except BaseException as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        os.environ["HF_ASSETS_PATH"] = _PLACEHOLDER
+
+
+good, msg = _raises(None, "HF_ASSETS_PATH")
+check("没设 HF_ASSETS_PATH 时拒绝构造(而不是在随机基座上训)", good, msg)
+good, msg = _raises("assets/hf/x", "绝对路径")
+check("HF_ASSETS_PATH 是相对路径时拒绝构造", good, msg)
+os.environ["INITIAL_LOAD_PATH"] = "/nonexistent-weights-dir"
+try:
+    c2 = getattr(R, _SMOKE)()
+    check("INITIAL_LOAD_PATH 给了就从它加载权重",
+          c2.checkpoint.initial_load_path == "/nonexistent-weights-dir" and c2.hf_assets_path == _PLACEHOLDER,
+          f"initial_load_path={c2.checkpoint.initial_load_path}")
+except BaseException as exc:  # noqa: BLE001
+    check("INITIAL_LOAD_PATH 给了就从它加载权重", False, f"{type(exc).__name__}: {exc}")
+finally:
+    os.environ.pop("INITIAL_LOAD_PATH", None)
+
+print("\n== NPU GDN override 这个名字存在吗")
+try:
+    import importlib
+
+    _mod_name, _attr = R.NPU_GDN_OVERRIDE.rsplit(".", 1)
+    _mod = importlib.import_module(_mod_name)
+    check(f"{_mod_name} 能 import,且有 `{_attr}`", hasattr(_mod, _attr))
+except BaseException as exc:  # noqa: BLE001
+    traceback.print_exc()
+    check("override 模块能 import", False, f"{type(exc).__name__}: {exc}")
+
+print("\n== 按训练启动器的方式解析参数")
+# scripts/run_train.sh 最终执行的是
+#   python -m torchtitan_npu.train --module <MODULE> --config <CONFIG> "$@"
+# 这里把同一段解析走一遍:命令行覆盖生效,且不会把上面几项冲掉。
+try:
+    from torchtitan.config import ConfigManager
+
+    parsed = ConfigManager().parse_args(
+        ["--module", "qwen36_lora_recipe", "--config", _SMOKE, "--training.steps", "5"]
+    )
+    check("--training.steps 5 生效", parsed.training.steps == 5, f"steps={parsed.training.steps}")
+    check("解析之后权重加载设置还在",
+          parsed.checkpoint.enable is True and parsed.checkpoint.initial_load_in_hf is True
+          and parsed.checkpoint.load_only is True and parsed.hf_assets_path == _PLACEHOLDER,
+          f"enable={parsed.checkpoint.enable} hf_assets_path={parsed.hf_assets_path}")
+    check("解析之后 override 还在", R.NPU_GDN_OVERRIDE in list(parsed.override.imports),
+          str(list(parsed.override.imports)))
+except BaseException as exc:  # noqa: BLE001
+    traceback.print_exc()
+    check("启动器的参数解析能走通", False, f"{type(exc).__name__}: {exc}")
 
 print("\n结论:" + ("通过。" if ok else "未通过(退出码 1)。"))
 sys.exit(0 if ok else 1)

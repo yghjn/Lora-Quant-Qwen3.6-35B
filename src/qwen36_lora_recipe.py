@@ -4,10 +4,22 @@
 
     export PYTHONPATH=<repo>/src:$PYTHONPATH
     NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_smoke \\
-      HF_ASSETS_PATH=<tokenizer 目录> \\
-      DATA_FILES=<prepare_corpus.py 的产物.jsonl> \\
+      HF_ASSETS_PATH=<HF 格式的 checkpoint 目录,绝对路径> \\
+      DATA_FILES=<prepare_corpus.py 的产物.jsonl,绝对路径> \\
       ADAPTER_SAVE_DIR=<adapter 输出目录> ADAPTER_SAVE_EVERY=20 \\
       bash scripts/run_train.sh --training.steps 20
+
+**这四个环境变量是本模块自己读的**(``_wire_weights`` / ``_base_lora_config`` /
+``qwen36_adapter_save``),不是 ``scripts/run_train.sh`` 读的 —— 那个脚本只认
+``NGPU`` / ``MODULE`` / ``CONFIG``,其余一律要写成 ``--xxx`` 命令行参数。
+所以换成别的 MODULE 时,``HF_ASSETS_PATH=...`` 这种写法**不会生效也不会报错**。
+
+``HF_ASSETS_PATH`` 一个目录管三件事(``trainer.py:567/598``、``dcp.py:534``):
+tokenizer(``tokenizer.json`` + ``tokenizer_config.json`` + chat template)、
+权重索引(``model.safetensors.index.json``)、权重分片本身。原始下载的
+Qwen3.6-35B-A3B 目录、``fakequant_rtn.py`` 的输出目录都满足(后者会把非权重文件
+原样带过去)。**NGPU 必须是 8**:配置里 expert_parallel_degree=8,
+而且 bf16 全模型约 70 GB,一张 60 GB 的卡装不下。
 
 本模块把 ``torchtitan_npu.models.qwen3_5`` 的全部公开名字搬进自己的命名空间,
 所以它可以整体替代那个 MODULE,**不用改 torchtitan-npu 仓库的任何一个文件**
@@ -210,8 +222,83 @@ def _wire_adapter_saver(config: Trainer.Config) -> Trainer.Config:
     return config
 
 
+# examples/qwen3_5/*.sh 默认带的那个 override。上游 GatedDeltaKernel 的默认后端是
+# "fla_chunked"(FLA 的 CUDA Triton kernel);NPU 上走的是这个 override 换上去的
+# Triton-Ascend kernel。配置工厂本身不注入它("不会静默注入 NPU 实现",
+# examples/qwen3_5/readme.md),是 examples 的启动脚本用 --override.imports 加的 ——
+# 我们直接调 scripts/run_train.sh,没有那层脚本,所以在这里加。
+NPU_GDN_OVERRIDE = "torchtitan_npu.override.qwen3_5.gated_delta.npu"
+
+
+def _wire_weights(config: Trainer.Config) -> Trainer.Config:
+    """基座权重从哪儿来(工单 §0.4 / §6.4)。**没有这一步,基座是随机初始化的。**
+
+    2026-11-16 核对 ``components/checkpointer/base.py``(上游 086bf6c16)才发现:
+
+    * ``CheckpointManager.Config.enable`` 默认 ``False``,而 ``load()`` 的第一行是
+      ``if not self.enable: return False``。上游 ``qwen35_35b_a3b()`` 没开它,
+      本文件原先也只改了 ``interval``。结果是训练正常启动、loss 正常下降、
+      ``exit=0``,但 adapter 补偿的是一个**随机基座** —— 和 DSv4.1 不设
+      ``UNISVQ_CKPT`` 是同一种白跑,而且一条告警都没有。
+    * ``hf_assets_path`` 的上游默认值是 ``./assets/hf/Qwen3.5-35B-A3B``(相对于
+      启动目录)。``HF_ASSETS_PATH`` 这个环境变量在 ``scripts/run_train.sh`` 和
+      ``3f9f99a`` 的配置里**没有任何人读**,只有 ``examples/`` 下的脚本把它转成
+      ``--hf-assets-path``。本工单的命令一直是按"它会被读"写的。
+
+    所以这里:读 ``HF_ASSETS_PATH``(必填),打开 checkpoint,并且
+    ``initial_load_in_hf=True`` —— 没给 ``initial_load_path`` 时上游就从
+    ``hf_assets_path`` 加载 HF safetensors(``dcp.py:534``)。
+
+    ``load_only=True``:允许加载、禁止一切保存。``enable=True`` 之后最后一步会
+    强制存一份全模型(``_should_save`` 的 ``last_step`` 分支),约 70 GB,
+    而我们要的只是 adapter,它由 ``qwen36_adapter_save`` 自己落盘。
+
+    ``INITIAL_LOAD_PATH``(可选):权重和 tokenizer 不在同一个目录时才用。
+    """
+    assets = os.environ.get("HF_ASSETS_PATH", "").strip()
+    if not assets:
+        raise RuntimeError(
+            "HF_ASSETS_PATH 未设置 —— 它是 HF 格式的 checkpoint 目录"
+            "(tokenizer + model.safetensors.index.json + 权重分片)。"
+            "不设的话基座不会被加载,等于在随机权重上训 adapter。"
+        )
+    if not os.path.isabs(assets):
+        raise RuntimeError(
+            f"HF_ASSETS_PATH 必须是绝对路径(现在是 {assets!r})—— "
+            "训练是 cd 到 torchtitan-npu 目录里起的,相对路径会指到别处。"
+        )
+    initial = os.environ.get("INITIAL_LOAD_PATH", "").strip() or None
+
+    config.hf_assets_path = assets
+    config.checkpoint = replace(
+        config.checkpoint,
+        enable=True,
+        load_only=True,
+        initial_load_path=initial,
+        initial_load_in_hf=True,
+        initial_load_model_only=True,
+    )
+    logger.info(
+        "基座权重: HF safetensors,来自 %s;tokenizer 来自 %s;checkpoint 只读不存",
+        initial or assets,
+        assets,
+    )
+    return config
+
+
+def _wire_npu_overrides(config: Trainer.Config) -> Trainer.Config:
+    """把 NPU 的 GDN kernel override 加进 ``override.imports``(已有就不重复加)。"""
+    imports = list(config.override.imports)
+    if NPU_GDN_OVERRIDE not in imports:
+        imports.append(NPU_GDN_OVERRIDE)
+    config.override = replace(config.override, imports=imports)
+    return config
+
+
 def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
     config = qwen35_35b_a3b()
+    config = _wire_weights(config)
+    config = _wire_npu_overrides(config)
 
     # loss 里的 global_vocab_size 是用未转换的 spec 算的。LoRA converter
     # target_modules=() 只动路由专家,碰不到 embedding / lm_head,词表不变,
@@ -254,6 +341,7 @@ def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
     config.metrics = replace(config.metrics, log_freq=1)
 
     # 基座不训,别存:全模型 DCP 约 70 GB,而 adapter 走 adapter_save 自己落盘。
+    # 真正挡住保存的是 _wire_weights 里的 load_only=True;interval 只是兜底。
     config.checkpoint = replace(
         config.checkpoint, interval=max(steps, 1), last_save_model_only=True
     )

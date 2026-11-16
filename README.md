@@ -189,7 +189,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 七个会改排期的发现
+### 八个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -300,6 +300,29 @@ TypeError 出在 `convert()` 的**最后一行**:前面的树遍历、后缀匹�
 以及 probe 自己的三处错 —— 按 `__dict__` 遍历 slots 配置所以一个节点都数不到、
 按类名里有没有 "LoRA" 判断所以全是假阴性、把结论性失败报成环境问题。都已修。
 
+**八、照原来的写法,基座权重根本不会被加载 —— 而且不报错。**
+
+2026-11-16 准备跑 §0.4、核对"`HF_ASSETS_PATH` 到底该填什么"时发现。三处都用
+`git show` 在已提交的代码上核过(upstream `086bf6c16`、torchtitan-npu `3f9f99a`):
+
+| 问题 | 依据 | 后果 | 本仓库的处理 |
+|---|---|---|---|
+| `checkpoint.enable` 默认 `False`,上游 `qwen35_35b_a3b()` 没开,本仓库的 recipe 也只改了 `interval` | `components/checkpointer/base.py`:`load()` 第一行是 `if not self.enable: return False` | 权重不加载,基座随机初始化;训练正常启动、loss 照降、`exit=0`,**一条告警都没有** | `_wire_weights`:`enable=True`、`initial_load_in_hf=True`;同时 `load_only=True`,否则最后一步会强制存一份约 70 GB 的全模型 |
+| `HF_ASSETS_PATH` / `INITIAL_LOAD_PATH` / `CKPT_SAVE_LOAD_PATH` 这些环境变量**没有任何人读** | `scripts/run_train.sh` 只认 `NGPU` / `MODULE` / `CONFIG`;只有 `examples/` 下的脚本把 `HF_ASSETS_PATH` 转成 `--hf-assets-path` | tokenizer 和权重去找上游默认的 `./assets/hf/Qwen3.5-35B-A3B` | recipe 自己读 `HF_ASSETS_PATH`(必填、必须绝对路径,否则拒绝构造);`INITIAL_LOAD_PATH` 可选 |
+| NPU 的 GDN kernel override 是 `examples/qwen3_5/*.sh` 用 `--override.imports` 加的,配置工厂不带 | `examples/qwen3_5/readme.md`:"配置工厂…不会静默注入 NPU 实现";上游 `GatedDeltaKernel` 默认后端是 `fla_chunked` | 直接调 `scripts/run_train.sh` 时走的是 FLA 自己的 kernel。**它在 NPU 上能不能跑没有验证过**,只知道 examples 不走它 | recipe 把 `torchtitan_npu.override.qwen3_5.gated_delta.npu` 加进 `override.imports`,跟齐 examples |
+
+第一条和 DSv4.1 不设 `UNISVQ_CKPT` 是同一种失败:跑完几个小时,得到一份补偿随机基座的
+adapter。它之所以一直没露头,是因为到这一步之前的所有闸门都不加载权重。
+
+连带更正:安装脚本结尾原先打印的 dry run 命令**是错的** —— `CONFIG` 写成了 27B 的
+`qwen35_27b_4k_sft`(不是这个模型)、没给 `DATA_FILES`(构造配置时就 `KeyError`)、
+`NGPU=1`(35B 的 EP=8,单卡也装不下)、路径用的是没人读的环境变量。本节上面的
+冒烟命令原先也写着 `NGPU=1`。都已改成"LoRA 训练怎么起"里那一条。
+
+**验到哪一步**:闸门 5 现在核对这些开关在配置里是对的,并且把训练启动器的参数解析
+原样走了一遍(`--training.steps 5` 生效、开关没被冲掉)。**真权重是否加载成功、
+加载后键是否全对上,只有上卡的 dry run 日志能回答。**
+
 ## 下一步
 
 与卡的可用性解耦,按这个顺序:
@@ -380,18 +403,45 @@ Hessian 样本最少、2bit 误差最大;是个便宜的对照假设,不是主�
 
 ```bash
 export PYTHONPATH=$PWD/src:$PYTHONPATH
-python src/prepare_corpus.py --tokenizer <tokenizer目录> --synthetic 64 --out corpus/smoke.jsonl
+python src/prepare_corpus.py --tokenizer <checkpoint目录> --synthetic 64 --out <工作目录>/smoke.jsonl
 ```
 
 ```bash
-cd ~/src/torchtitan-npu && NGPU=1 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_smoke HF_ASSETS_PATH=<tokenizer目录> INITIAL_LOAD_PATH=<假量化ckpt> DATA_FILES=<corpus/smoke.jsonl 的绝对路径> ADAPTER_SAVE_DIR=<adapter输出目录> ADAPTER_SAVE_EVERY=20 bash scripts/run_train.sh
+cd ~/src/torchtitan-npu && NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_smoke HF_ASSETS_PATH=<checkpoint目录> DATA_FILES=<工作目录>/smoke.jsonl ADAPTER_SAVE_DIR=<工作目录>/adapter ADAPTER_SAVE_EVERY=20 bash scripts/run_train.sh
 ```
+
+所有路径都要**绝对路径**(训练是 cd 到 torchtitan-npu 里起的)。
+
+**`<checkpoint目录>` 是 HF 格式的模型目录,一个目录管三件事**:tokenizer
+(`tokenizer.json`、`tokenizer_config.json`、chat template)、权重索引
+(`model.safetensors.index.json`)、权重分片。没有单独的"tokenizer 目录"。
+
+| 跑什么 | `HF_ASSETS_PATH` 填 |
+|---|---|
+| §0.4 的 5 步 dry run(只验"真权重能加载") | 原始下载的 Qwen3.6-35B-A3B 目录;命令末尾加 `--training.steps 5` |
+| 冒烟 / 交付训练 | `fakequant_rtn.py` 或 `offline_ptq.py` 的**输出目录**(它们会把 tokenizer、`config.json`、索引原样带过去)—— adapter 要补偿的是那一份量化误差 |
+
+**`NGPU` 必须是 8**:配置里 `expert_parallel_degree=8`,而且 bf16 全模型约 70 GB,
+一张 60 GB 的卡装不下。
+
+这几个环境变量(`HF_ASSETS_PATH` / `DATA_FILES` / `ADAPTER_SAVE_DIR` /
+`ADAPTER_SAVE_EVERY`,以及可选的 `INITIAL_LOAD_PATH`)是 **`qwen36_lora_recipe`
+自己读的**。`scripts/run_train.sh` 只认 `NGPU` / `MODULE` / `CONFIG`,换成别的
+MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
+
+**启动后先看日志里这三行**(都出自上游 `components/checkpointer/dcp.py`):
+
+| 日志 | 含义 |
+|---|---|
+| `Loading HF safetensors from --model.hf_assets_path: <目录>` | 开始加载真权重 |
+| `Finished loading the checkpoint in N seconds.` | 加载完成 |
+| `No checkpoint was provided, this is a fresh start.` | **没加载,基座是随机的** —— 立刻停 |
 
 `MODULE=qwen36_lora_recipe` 不是 `torchtitan_npu.models.qwen3_5` —— 那个模块的
 全部名字都被搬进了我们这个模块,所以它是**超集**,而 torchtitan-npu 的
 clone 一个文件都不用改。在一份**干净的** clone 上这句话要靠本仓库的
-`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"七个会改排期的
-发现"第七条。起训练之前先确认闸门 5 过了:
+`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"八个会改排期的
+发现"第七、第八条。起训练之前先确认闸门 5 过了:
 
 ```bash
 python3 verify/probe_recipe_cpu.py
@@ -604,10 +654,10 @@ conda activate lqq-train && bash env/2_pip_train.sh
 | 2 | **torch_npu 能 import** | ABI 不符 / CANN 找不到 |
 | 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule);或 torchtitan-npu 没钉在 `3f9f99a`(报 `No module named 'attn_gym.…'`) |
 | 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑"。缺 `fla` / `triton` 会在它之前被拦下 |
-| 5 | 本仓库的训练配置能 import、能构造(`verify/probe_recipe_cpu.py`) | 缺 `torchvision`:训练入口 `torchtitan_npu.models.qwen3_5` 要它,闸门 4 的入口走不到 |
+| 5 | 本仓库的训练配置能 import、能构造,**且配置里"加载真权重"是开着的**(`verify/probe_recipe_cpu.py`) | 缺 `torchvision`:训练入口 `torchtitan_npu.models.qwen3_5` 要它,闸门 4 的入口走不到。或 recipe 被改回了不加载权重的写法(见"八个会改排期的发现"第八条) |
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
-真正上卡的 5 步 dry run 是脚本最后单独给出的一条命令,留给卡空闲时跑。
+真正上卡的 5 步 dry run 是脚本最后单独给出的几条命令(要 8 张卡),见"LoRA 训练怎么起"。
 
 **索引不通长什么样。** 旧版脚本上的表现是闸门 1 报
 `No matching distribution found for filelock`,紧接着
