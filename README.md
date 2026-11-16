@@ -598,6 +598,9 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
 | torch | `2.14.0.dev20260719+cpu` cp312 aarch64(直链) |
 | torch_npu | `2.14.0.dev20260808` |
 | triton-ascend | `3.2.1` |
+| fla-core | `0.5.2`(+ `einops`;Qwen 模型专用) |
+| numpy | `>=2.0,<2.3` |
+| attn-gym | `0.0.9` |
 | spmd_types | `0.2.3`(不是 0.3.0,torchtitan 0.3.0 钉的是这个) |
 
 **torch 和 torch_npu 必须成对换,不要只升一个。** `aten::_scaled_grouped_mm_v2`
@@ -631,6 +634,18 @@ TORCH_WHL=<本地 .whl 的路径> bash env/2_pip_train.sh
 * **闸门 3/4 里的 `aclInit ... error code is 107001` / `Invalid device ID` 是预期的。**
   这两道闸门故意把 `ASCEND_RT_VISIBLE_DEVICES` 置空以免占卡,torchtitan_npu 的一个补丁
   想初始化 NPU 没成,自己打一行 `[PATCH] ... skipped` 跳过。失败原因只看 Traceback。
+* **Qwen 模型有两个 requirements 里没列的硬依赖:`fla-core` 和 `triton-ascend`。**
+  upstream torchtitan 的 `models/qwen3_5/model.py` 在模块顶层
+  `from fla.modules.conv.triton.ops import ...`,而 torchtitan 和 torchtitan-npu 的
+  requirements 都没列它,只有 `models/qwen3_5/README.md` 里一句
+  `pip install av torchvision flash-linear-attention`。所以闸门 3(只 import 训练入口)
+  能过,闸门 4(第一次 import Qwen 模型)才报 `No module named 'fla'`。
+  `fla` 是 flash-linear-attention 的包名,算子在它的子包 `fla-core` 里,只装
+  `fla-core==0.5.2 einops` 就够。钉 0.5.2 是因为它的 `[npu]` 配套正好是
+  `triton-ascend==3.2.1`。fla 的算子又在顶层 import `triton`(由 triton-ascend 提供),
+  所以 triton-ascend 也是闸门 4 的前提,不再是"训练前补上就行"。它的索引连不上时
+  直接下 wheel(约 188 MB):
+  `https://repo.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl`
 * **环境不要建在 `/dev/shm`。** 上一份训练环境就建在那里,随重启整个消失。
 * **CANN 版本决定融合算子可用性。** 9.0.1 缺 `aclnnMhcPost` / `aclnnSparseFlashMla`
   等符号,9.1.0 才有;而且 `libopapi.so` 在 ops 包里,只装 toolkit 验不出来。

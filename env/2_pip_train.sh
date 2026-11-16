@@ -353,10 +353,30 @@ pip_install \
     attn-gym==0.0.9 pybind11 "$NUMPY_SPEC" PyYAML ninja scipy==1.13.1 safetensors==0.8.0 \
     "spmd_types==0.2.3" torchdata tensorboard tyro blobfile tiktoken tomli_w tabulate \
     "datasets==4.7.0" tokenizers sentencepiece psutil wandb torch_checkpointing \
+    "fla-core==0.5.2" einops \
     || die "其余依赖安装失败" "要换镜像:PIP_IDX=https://pypi.tuna.tsinghua.edu.cn/simple 重跑"
-TRITON_OK=1
-"$P" -m pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple "triton-ascend==3.2.1" \
-    || { TRITON_OK=0; echo "   (triton-ascend 装失败,不拦闸门 3/4;结尾会再提醒一次)"; }
+# 上面最后两个(fla-core / einops)是 Qwen 专属的:upstream torchtitan 的
+# models/qwen3_5/model.py 在模块顶层 `from fla.modules.conv.triton.ops import ...`,
+# 而 torchtitan 和 torchtitan-npu 的 requirements 都没列 —— 只有 qwen3_5/README.md
+# 里一句 `pip install av torchvision flash-linear-attention`。
+#   - `fla` 是 flash-linear-attention 的包名;算子(fla.ops / fla.modules)在它的
+#     子包 fla-core 里,整包只多出依赖 transformers 的 layers/models,这里用不到。
+#   - 钉 0.5.2:它的 [npu] extra 钉的是 triton-ascend==3.2.1,和下面装的一致
+#     (0.6.0 的 [npu] 是 triton-ascend 3.6.0 + torch 2.10)。base 依赖只有 einops。
+#   - 2026-11-16 在开发机一个 torch 2.9 + triton-ascend 3.2.0 的环境里(不安装,
+#     只解包进 sys.path)照 model.py 的五条 import 试过,0.5.2 全过,实际加载的
+#     第三方模块只有 einops / numpy / packaging / triton。
+#
+# triton-ascend 因此也是 GATE 4 的硬前提:fla 的算子在顶层 import triton。
+# 装不上先不 die(GATE 3 不需要它),到 GATE 4 之前统一检查。
+TRITON_WHL="https://repo.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
+HAVE_TRITON="$(pkg_ver triton-ascend)"
+if [ "${HAVE_TRITON#3.2.1}" != "$HAVE_TRITON" ]; then
+    echo "已装 triton-ascend $HAVE_TRITON,跳过下载。"
+else
+    "$P" -m pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple "triton-ascend==3.2.1" \
+        || echo "   (triton-ascend 装失败。GATE 3 不需要它,先往下走;GATE 4 之前会拦住并给出手动装法)"
+fi
 
 # ---------------------------------------------------------------- GATE 3
 say "4. torchtitan_npu 能 import 吗  (GATE 3)"
@@ -387,6 +407,22 @@ cpu_only "$P" -c 'import torchtitan_npu.train; print("TRAIN IMPORT OK")' \
 # ---------------------------------------------------------------- GATE 4
 say "5. 分组专家 LoRA 能挂上 Qwen3.5-35B-A3B 吗  (GATE 4)"
 echo "这是整条 LoRA 线的闸门。纯 CPU,不占卡。"
+echo "fla-core $(pkg_ver fla-core) / einops $(pkg_ver einops) / triton-ascend $(pkg_ver triton-ascend)"
+# Qwen 模型一 import 就要 fla 和 triton。缺了在这里说清楚,不要让 probe 报一个
+# 孤零零的 "No module named 'fla'"。用 find_spec,不真 import(import triton 很慢)。
+MISSING_Q="$("$P" -c '
+import importlib.util as u
+print(" ".join(m for m in ("triton", "fla", "einops") if u.find_spec(m) is None))')"
+if [ -n "$MISSING_Q" ]; then
+    die "GATE 4 的前提不满足,缺这些模块:$MISSING_Q" \
+        "upstream torchtitan 的 Qwen 模型在顶层 import fla,fla 的算子又在顶层 import triton。" \
+        "  triton  由 triton-ascend 提供(不是 PyPI 上那个 triton)。索引连不上就手动下 wheel:" \
+        "            $TRITON_WHL" \
+        "            $P -m pip install --no-deps <下到本地的 .whl>" \
+        "  fla     $P -m pip install fla-core==0.5.2 einops" \
+        "  einops  $P -m pip install einops" \
+        "补完重跑本脚本即可,已装好的会跳过。"
+fi
 # 这里**不要**加 `-I`。-I 隐含 -E(忽略 PYTHONPATH)和 -s(去掉 user site),
 # 于是 GATE 4 失败后想用 PYTHONPATH / TT_ROOT 救一把的那条路也被堵死。
 # 包是装进本 conda 环境的 prefix,隔离在这儿什么也不买。
@@ -398,13 +434,6 @@ echo "解释器: $P"
 echo "仓库:   $TT_DIR"
 [ "$RC" -eq 0 ] && echo "四道闸门全过。" \
     || echo "GATE 4 未过(rc=$RC)—— 上面的输出会指出是 import 问题还是判据不成立。"
-if [ "$TRITON_OK" -ne 1 ] && [ -z "$(pkg_ver triton-ascend)" ]; then
-    echo
-    echo "!! triton-ascend 没装上。四道闸门不依赖它,但 Qwen 的 gated_delta 走 Triton kernel,"
-    echo "   上卡训练之前必须补:"
-    echo "     $P -m pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple triton-ascend==3.2.1"
-    echo "   (那个索引是第四个外部地址,连不上时和 torch / torch_npu 一样,换 proxy 状态或手动下 wheel)"
-fi
 cat <<NOTE
 
 下一步(需要一张空闲卡):5 步 dry run,确认真权重能加载。

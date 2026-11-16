@@ -100,6 +100,34 @@ def _wire_paths() -> str | None:
 
 TT_ROOT_USED = _wire_paths()
 
+# upstream torchtitan 的 Qwen 模型(models/qwen3_5/model.py)在**模块顶层** import
+# 这几个包,但 torchtitan 和 torchtitan-npu 的 requirements 里都没列它们 ——
+# 只在 models/qwen3_5/README.md 里有一句 `pip install ... flash-linear-attention`。
+_TRITON_WHL = (
+    "https://repo.huaweicloud.com/ascend/repos/pypi/triton-ascend/"
+    "triton_ascend-3.2.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl"
+)
+_KNOWN_MISSING = {
+    "fla": [
+        "`fla` 是 flash-linear-attention 的包名。Qwen 的 gated-delta / 因果卷积算子在",
+        "它的子包 fla-core 里,只装 fla-core 就够(不需要带 transformers 的整包):",
+        "    pip install fla-core==0.5.2 einops",
+        "钉 0.5.2:它的 [npu] 配套是 triton-ascend==3.2.1,和 torchtitan-npu 要的一致。",
+        "fla 的算子在顶层 import triton,所以 triton-ascend 也得先装上(见下一条)。",
+    ],
+    "triton": [
+        "`triton` 这个模块名由 triton-ascend 提供(不是 PyPI 上那个 triton)。",
+        "    pip install --no-deps -i https://triton-ascend.osinfra.cn/pypi/simple triton-ascend==3.2.1",
+        "那个索引连不上就直接下 wheel(cp312 / aarch64,约 188 MB)再本地装:",
+        f"    {_TRITON_WHL}",
+    ],
+    "einops": ["fla-core 的依赖:pip install einops"],
+    "attn_gym": [
+        "attn-gym 版本和 torchtitan-npu 的 commit 不是一套。",
+        "核对过的组合:torchtitan-npu 3f9f99a + attn-gym==0.0.9。",
+    ],
+}
+
 
 def _env_hints(exc: BaseException | None = None) -> list[str]:
     """给 import 失败时附的环境诊断。按"最可能是这个"排序。
@@ -128,6 +156,16 @@ def _env_hints(exc: BaseException | None = None) -> list[str]:
     if not missing_tt and TT_ROOT_USED is not None:
         # 路径是通的、错的是别的东西(版本之类)。下面那段就不用说了。
         out += ["(路径没问题:torchtitan 解析到了。上面那条才是真因。)"]
+        missing = (
+            (getattr(exc, "name", "") or "").split(".")[0]
+            if isinstance(exc, ModuleNotFoundError)
+            else ""
+        )
+        if missing in _KNOWN_MISSING:
+            out += ["", f"缺的是 `{missing}`:"] + ["   " + s for s in _KNOWN_MISSING[missing]]
+        elif missing:
+            out += ["", f"缺的是 `{missing}`,不在已知清单里。先试 `pip install {missing}`,"
+                        "并把这个名字记进 env/2_pip_train.sh。"]
         return out
     out += [
         "`import torchtitan` 报 No module named 的根因(不是漏装一个包那么简单):",
