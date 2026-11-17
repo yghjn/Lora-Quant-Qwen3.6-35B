@@ -630,6 +630,9 @@ sha256 `4a3c9264814b2f81c6f36f285cf13202952d71247e162c168950e6555fa492b0`。
 | MATH-500 | 500 | 0 |
 | LiveCodeBench `v6`(175 题的增量) | 175 | 0 |
 
+**已定(2026-11-17):LoRA 复评的 LiveCodeBench 用 175 题版**,所以这份提问文件可以直接用。
+下面这段说的是万一以后改主意要注意什么。
+
 **LiveCodeBench 这一条有前提。** 同事的去污染是对着 167 题的那个子集做的,他的来源清单里
 另有 888 道"其他 LiveCodeBench 题"。评测工具自己的说明(`scripts/download_lcb_release.sh`)
 写着模型卡上的"LiveCodeBench v6"指 **1055 题的 release_v6**,而项目一直打分用的是 175 题的
