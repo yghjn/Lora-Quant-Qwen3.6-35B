@@ -120,7 +120,7 @@ verify/
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,26 项,纯 CPU,参考值用 einsum 独立算
-  test_gen_trace_cpu.py    轨迹生成自测,37 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
+  test_gen_trace_cpu.py    轨迹生成自测,44 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
   test_adapter_save_cpu.py adapter 落盘自测,21 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
@@ -158,7 +158,7 @@ verify/
 | §4.3 混精评测 | 未做,卡被占 |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**2026-11-17 在另一台机器 8 卡上跑通 5 步 smoke**(原始权重 + 合成语料) |
 | §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),21 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
-| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,37 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
+| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,44 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,26 项自测全过;读分片时会规范化参数名(旧分片也能用) |
 | §6 LoRA 训练本身 | 5 步 smoke 已跑通;**正式训练未做** —— 还差量化后的基座、真实语料、基线评测 |
 
@@ -606,7 +606,7 @@ DSv4.1 的 LoRA 用的不是公开数据集,而是**未量化的基线模型自�
 对话标记。能复用的是**提问**(与模型无关)和方法。`src/gen_trace.py` 是移植过来的版本:
 
 ```bash
-python src/gen_trace.py --prompts <提问文件> --out <工作目录>/traces.jsonl --url http://localhost:8900/v1/chat/completions --model <服务里的模型名> --n 1000 --max-tokens 3072 --exclude <评测集题目文件>
+python src/gen_trace.py --prompts <提问文件> --out <工作目录>/traces.jsonl --url http://127.0.0.1:8900/v1/chat/completions --model <服务里的模型名> --n 1000 --max-tokens 3072 --exclude <评测集题目文件>
 ```
 
 ```bash
@@ -678,9 +678,14 @@ python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --exclude <releas
 * **顺带解决了"空思考块"**:自生成的轨迹带真实的推理,渲出来是
   `<think>\n推理\n</think>\n\n答案`,和开着思考模式的评测一致。
 * 采样参数默认是评测那边的(0.6 / 0.95 / top_k 20),不是 DSv4.1 的 1.0 / 0.95。
-* 请求 localhost 时不走代理(不改环境变量,只是这一个请求不用代理)。
+* 请求本机地址时不走代理(不改环境变量,只是这一个请求不用代理)。
+* **`--url` 用 `127.0.0.1`,不要用 `localhost`。** 2026-11-17 第一次对着真环境跑,50 条提问
+  全部报 `OSError(99, 'Cannot assign requested address')`:那台机器(容器)没有 IPv6 回环,
+  而 `localhost` 被解析成了 `::1`。脚本现在发提问之前先做**连接预检**(问 `/v1/models`):
+  服务没起来、模型名不对就直接停并说明是哪种情况,不发提问、不留空文件;碰到上面这种
+  情况会自动改用 `127.0.0.1`。
 
-**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(37 项)。
+**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(44 项)。
 另外把产物用**真的 Qwen3.6 tokenizer 和模板**过了一遍上游的 `ChatDataset`:带推理的样本,
 没被屏蔽的 label 解出来正是"推理 + 答案",提问部分被屏蔽。**没验到的**:对着真的服务生成、
 `vllm serve` 返回的推理在哪个字段(`reasoning_content` / `reasoning` / 留在 content 里

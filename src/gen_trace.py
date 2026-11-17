@@ -2,7 +2,7 @@
 """让**未量化的基线模型自己**生成推理轨迹,当 LoRA 的训练语料(工单 §6.6)。
 
     python src/gen_trace.py --prompts <提问文件> --out traces.jsonl \\
-        --url http://localhost:8900/v1/chat/completions --model <服务里的模型名> \\
+        --url http://127.0.0.1:8900/v1/chat/completions --model <服务里的模型名> \\
         --n 1000 --max-tokens 3072
 
     python src/prepare_corpus.py --tokenizer <checkpoint 目录> --src traces.jsonl \\
@@ -61,8 +61,11 @@ DeepSeek 的输出,用它训等于教 Qwen 模仿另一个模型。能从那边�
   另有 888 道别的 LiveCodeBench 题。换用 1055 题的 release_v6 评测时**必须**重新排除。
 * `--dump-prompts FILE`:只做筛选 / 去重 / 排除 / 抽样,把提问写出来就退出,不请求服务。
 * 可以断点续跑(`--resume`),并发用线程池。
-* 请求 localhost 时不走代理(环境里设了 http_proxy 的话,本机请求会被发到代理上去);
+* 请求本机地址时不走代理(环境里设了 http_proxy 的话,本机请求会被发到代理上去);
   其它地址照环境变量来。
+* **先做连接预检**:发提问之前先问 `/v1/models`,服务不在、模型名不对就直接停,并说明
+  是哪种情况。`localhost` 在没有 IPv6 回环的容器里会被解析成 `::1` 而连不通
+  (报 `Cannot assign requested address`),这时自动改用 `127.0.0.1`;默认 URL 也用它。
 
 提问文件的格式(自动识别,可以混着给)
 ------------------------------------
@@ -283,6 +286,72 @@ def _opener(url: str) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener()
 
 
+def _explain(exc: BaseException, url: str) -> list[str]:
+    """把连接错误翻成"是什么情况、怎么办"。"""
+    reason = getattr(exc, "reason", exc)
+    code = getattr(reason, "errno", None)
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if code == 99:  # EADDRNOTAVAIL
+        lines = ["操作系统说这个地址连不出去(Cannot assign requested address)。"]
+        if host == "localhost":
+            lines.append("最常见的原因:localhost 被解析成了 IPv6 的 ::1,而这台机器(容器)没有 IPv6 回环。")
+            lines.append("把 --url 里的 localhost 换成 127.0.0.1。")
+        return lines
+    if code == 111:  # ECONNREFUSED
+        return ["没有服务在听这个地址和端口(Connection refused)。",
+                "服务没起来、还在加载模型、端口不对,或者服务绑在了别的地址上。",
+                "看服务的日志里有没有 'Uvicorn running on ...' / 'Application startup complete'。"]
+    if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
+        return ["连接超时。服务可能还在加载模型,或者地址不可达。"]
+    return [f"{type(reason).__name__}: {reason}"]
+
+
+def preflight(args) -> None:
+    """先问一下服务在不在、模型名对不对,再开始发提问。可能会改写 args.url。
+
+    2026-11-17 第一次对着真环境跑:50 条提问全部报
+    `OSError(99, 'Cannot assign requested address')`,脚本把 50 条都发完才说"一条都没
+    写出来",还留下一个空的输出文件。原因是 localhost 解析成了 ::1。
+    """
+    parsed = urllib.parse.urlparse(args.url)
+    if not parsed.path.endswith("/chat/completions"):
+        print("  (--url 不是 .../chat/completions 结尾,跳过连接预检)")
+        return
+
+    def models_url(url: str) -> str:
+        u = urllib.parse.urlparse(url)
+        return urllib.parse.urlunparse(u._replace(path=u.path[: -len("/chat/completions")] + "/models"))
+
+    def fetch(url: str):
+        with _opener(url).open(models_url(url), timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        listing = fetch(args.url)
+    except urllib.error.HTTPError as exc:
+        print(f"  (服务可达,但 {models_url(args.url)} 返回 HTTP {exc.code},没法核对模型名,继续)")
+        return
+    except Exception as exc:  # noqa: BLE001
+        code = getattr(getattr(exc, "reason", exc), "errno", None)
+        host = (parsed.hostname or "").lower()
+        if code == 99 and host == "localhost":
+            alt = urllib.parse.urlunparse(parsed._replace(netloc=parsed.netloc.replace("localhost", "127.0.0.1", 1)))
+            try:
+                listing = fetch(alt)
+            except Exception as exc2:  # noqa: BLE001
+                die(f"连不上服务 {args.url}(换成 127.0.0.1 也不行)。", *_explain(exc2, alt))
+            print("  注意: localhost 在这台机器上连不通(被解析成了 IPv6 的 ::1),已改用 127.0.0.1。")
+            args.url = alt
+        else:
+            die(f"连不上服务 {args.url}。", *_explain(exc, args.url), "一条提问都没发,也没有写任何文件。")
+
+    names = [m.get("id") for m in (listing.get("data") or []) if isinstance(m, dict)]
+    if names and args.model not in names:
+        die(f"服务里没有叫 {args.model!r} 的模型。", f"服务报告的模型名: {names}",
+            "把 --model 改成其中一个(就是 vllm serve 的 --served-model-name)。")
+    print(f"  服务可达,模型: {names or '(服务没报告模型名)'}")
+
+
 def split_reply(message: dict) -> tuple[str, str]:
     """(推理, 答案)。服务端开了 reasoning parser 时两者是分开的字段;没开时推理
     留在 content 里,形如 `推理…</think>\\n\\n答案`(生成提示已经以 `<think>\\n` 结尾)。"""
@@ -318,7 +387,9 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prompts", action="append", required=True, help="提问文件,可重复给")
     ap.add_argument("--out", help="输出 jsonl(生成时必填)")
-    ap.add_argument("--url", default="http://localhost:8900/v1/chat/completions")
+    ap.add_argument("--url", default="http://127.0.0.1:8900/v1/chat/completions",
+                    help="用 127.0.0.1 而不是 localhost:后者在没有 IPv6 回环的容器里会连不通")
+    ap.add_argument("--no-preflight", action="store_true", help="不做连接预检(默认会先问一下服务在不在、模型名对不对)")
     ap.add_argument("--model", help="服务里的模型名(vllm serve 的 --served-model-name;生成时必填)")
     ap.add_argument("--dump-prompts", metavar="FILE",
                     help="只做到「筛选 + 去重 + 排除评测题 + 抽样」为止,把提问写成 jsonl 就退出,不请求服务。"
@@ -380,7 +451,8 @@ def main() -> int:
         return 0
 
     done_keys: set[str] = set()
-    if os.path.exists(args.out):
+    # 空文件不算"已存在":上一次一条都没写出来时留下的就是它
+    if os.path.exists(args.out) and os.path.getsize(args.out) > 0:
         if not args.resume:
             die(f"{args.out} 已存在。", "要接着跑加 --resume;要重来先把它挪走。")
         for sample in read_samples(args.out):
@@ -398,6 +470,8 @@ def main() -> int:
         print("  没有要问的了。")
         return 0
 
+    if not args.no_preflight:
+        preflight(args)  # 连不上就在这里停,不发提问、不建文件;可能把 localhost 改成 127.0.0.1
     opener = _opener(args.url)
     lock = threading.Lock()
     counts = {"写出": 0, "截断": 0, "没有推理": 0, "没有答案": 0, "请求失败": 0}
@@ -482,12 +556,20 @@ def main() -> int:
         print(f"  生成 token(推理+答案): {pct(ctoks)},合计 {sum(ctoks) / 1e6:.2f} M")
     if any(rtoks):
         print(f"  其中推理 token:        {pct(rtoks)}")
+    if counts["写出"] == 0 and not done_keys:
+        try:  # 别留一个空文件在那儿
+            if os.path.getsize(args.out) == 0:
+                os.remove(args.out)
+        except OSError:
+            pass
+        hint = ["看上面的计数。"]
+        if counts["请求失败"] == len(prompts) and errors:
+            hint = ["所有请求都失败了,这是连接或服务的问题,不是提问的问题。", f"第一个错误: {errors[0]}"]
+        die("一条都没写出来。", *hint)
     print(f"  耗时 {(time.time() - began) / 60:.1f} 分钟 -> {args.out}")
     print("\n下一步(验模板、数 token、丢掉训练装不下的):")
     print(f"    python src/prepare_corpus.py --tokenizer <checkpoint 目录> --src {args.out} "
           "--seq-len 4096 --out corpus.jsonl")
-    if counts["写出"] == 0 and not done_keys:
-        die("一条都没写出来。", "看上面的计数和请求失败的例子。")
     return 0
 
 

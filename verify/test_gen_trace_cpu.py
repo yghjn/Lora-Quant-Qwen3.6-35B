@@ -45,6 +45,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):  # 安静
         pass
 
+    def do_GET(self):  # noqa: N802 - 连接预检问的 /v1/models
+        payload = json.dumps({"object": "list", "data": [{"id": "fake", "object": "model"}]}).encode("utf-8")
+        self.send_response(200 if self.path.endswith("/models") else 404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_POST(self):  # noqa: N802
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         RECEIVED.append(body)
@@ -237,6 +245,56 @@ def main() -> int:
             check("--exclude 直接给评测集目录(里面是 parquet)",
                   p.returncode == 0 and len(got2) == 5 and not any("Answer with the letter" in q for q in got2),
                   p.stdout[-400:] + p.stderr[-300:])
+
+        print("\n--- 连接预检:连不上 / 模型名不对,第一时间说清楚 ---")
+        # 2026-11-17 第一次对着真环境跑:localhost 解析成 ::1,50 条全报 OSError(99),
+        # 脚本发完 50 条才说"一条都没写出来",还留下一个空文件。
+        import socket
+        import urllib.error
+
+        sys.path.insert(0, SRC)
+        import gen_trace as G  # noqa: E402
+
+        lines = " ".join(G._explain(urllib.error.URLError(OSError(99, "Cannot assign requested address")),
+                                     "http://localhost:8901/v1/chat/completions"))
+        check("errno 99 + localhost:说明是 IPv6 回环的问题,并让换成 127.0.0.1",
+              "::1" in lines and "127.0.0.1" in lines, lines)
+        lines = " ".join(G._explain(urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+                                     "http://127.0.0.1:8901/v1/chat/completions"))
+        check("errno 111:说明是没有服务在听", "没有服务在听" in lines, lines)
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        dead_port = sock.getsockname()[1]
+        sock.close()                               # 这个端口现在没人听
+        dead_out = os.path.join(tmp, "dead.jsonl")
+        n_req = len(RECEIVED)
+        p = run(GEN, "--prompts", prompts, "--model", "fake", "--n", "0", "--out", dead_out,
+                "--url", f"http://127.0.0.1:{dead_port}/v1/chat/completions")
+        check("服务没起来:直接停,退出码非 0,说明原因",
+              p.returncode != 0 and "连不上服务" in (p.stdout + p.stderr), p.stdout[-300:] + p.stderr[-400:])
+        check("服务没起来:一条提问都没发,也没留下输出文件",
+              len(RECEIVED) == n_req and not os.path.exists(dead_out))
+        p = run(GEN, "--prompts", prompts, "--url", url, "--model", "qwen36", "--n", "0", "--out", dead_out)
+        check("模型名不对:直接停,并列出服务里有的模型名",
+              p.returncode != 0 and "fake" in (p.stdout + p.stderr) and not os.path.exists(dead_out),
+              p.stdout[-300:] + p.stderr[-400:])
+
+        only500 = os.path.join(tmp, "only500.jsonl")
+        with open(only500, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"prompt": "CASE_500 服务端出错" + PAD}, ensure_ascii=False) + "\n")
+        out500 = os.path.join(tmp, "out500.jsonl")
+        p = run(GEN, "--prompts", only500, "--url", url, "--model", "fake", "--n", "0", "--out", out500)
+        check("请求全部失败:退出码非 0,说明是服务的问题,不留空文件,也不打印「下一步」",
+              p.returncode != 0 and "所有请求都失败" in (p.stdout + p.stderr)
+              and not os.path.exists(out500) and "下一步" not in p.stdout, p.stdout[-400:] + p.stderr[-300:])
+
+        empty_out = os.path.join(tmp, "empty_out.jsonl")
+        open(empty_out, "w").close()
+        p = run(GEN, "--prompts", prompts, "--url", url, "--model", "fake", "--n", "0", "--exclude", evalset,
+                "--out", empty_out)
+        check("--out 是个空文件时不用 --resume 也能跑(上次失败留下的)",
+              p.returncode == 0 and len(read_jsonl(empty_out)) == 6, p.stdout[-300:] + p.stderr[-300:])
 
         print("\n--- 断点续跑 ---")
         p = run(GEN, *common)
