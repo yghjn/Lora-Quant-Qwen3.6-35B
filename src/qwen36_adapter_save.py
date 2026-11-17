@@ -13,7 +13,8 @@ torchtitan-npu clone 里没有它。后果是训练能正常启动、加载完 7
 
 * 文件名 `adapter_r<rank:02d>_step<step:06d>.safetensors`,每个 rank 写自己那片,
   不做 all-gather(专家 adapter 按 EP 分片,rank r 持有自己那段专家);
-* 张量只收名字里带 `lora_` 的参数,转 bf16;
+* 张量只收名字里带 `lora_` 的参数,转 bf16;键是**规范名字**(去掉
+  `_checkpoint_wrapped_module` 这类包装模块引入的段),和 state_dict 一致;
 * metadata:`step`、`rank`,以及每个 DTensor 参数的
   `<name>.global_shape`(逗号分隔)和 `<name>.placements`。
 
@@ -32,7 +33,20 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["register_adapter_saver", "save_adapters", "shard_name"]
+__all__ = ["register_adapter_saver", "save_adapters", "shard_name", "canonical_name", "WRAPPER_SEGMENTS"]
+
+# 包装模块插进参数名里的那一段。activation checkpoint 给每一层套了 CheckpointWrapper,
+# `named_parameters()` 给出的是
+#   layers.0._checkpoint_wrapped_module.moe.routed_experts.inner_experts.w13_lora_a
+# 而 state_dict / HF checkpoint 那边的规范名字没有中间那一段。2026-11-17 第一批真
+# 训练出来的分片带着它,merge_lora.py 认不出来。落盘时去掉,和 merge_lora.py 里的
+# 清单保持一致(verify/test_adapter_save_cpu.py 对拍两边)。
+WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module", "_fsdp_wrapped_module", "_orig_mod")
+
+
+def canonical_name(name: str) -> str:
+    """去掉参数名里由包装模块引入的那几段。"""
+    return ".".join(seg for seg in name.split(".") if seg not in WRAPPER_SEGMENTS)
 
 
 def shard_name(rank: int, step: int) -> str:
@@ -69,11 +83,14 @@ def save_adapters(model_parts, out_dir: str, step: int) -> int:
         for name, p in part.named_parameters():
             if "lora_" not in name:
                 continue
+            key = canonical_name(name)
+            if key in tensors:
+                raise RuntimeError(f"adapter 参数名规范化之后撞车:{name} -> {key}")
             local, is_dtensor = _local(p)
-            tensors[name] = local.detach().to(torch.bfloat16).cpu().contiguous()
+            tensors[key] = local.detach().to(torch.bfloat16).cpu().contiguous()
             if is_dtensor:
-                meta[name + ".global_shape"] = ",".join(str(x) for x in p.shape)
-                meta[name + ".placements"] = str(p.placements)
+                meta[key + ".global_shape"] = ",".join(str(x) for x in p.shape)
+                meta[key + ".placements"] = str(p.placements)
     if not tensors:
         return 0
     path = os.path.join(out_dir, shard_name(rank, step))

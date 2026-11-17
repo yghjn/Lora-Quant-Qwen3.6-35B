@@ -124,5 +124,53 @@ with tempfile.TemporaryDirectory() as d:
     except ValueError:
         check("EVERY=0 被拒绝", True)
 
+print("== F. 模块被 activation checkpoint 包了一层(真训练就是这样)")
+# 训练时每一层都套了 torch 的 CheckpointWrapper,named_parameters() 给出的名字中间
+# 多一段 `_checkpoint_wrapped_module`。2026-11-17 第一批真分片带着它,merge_lora.py
+# 把 200 个 adapter 全判成了"不在路由专家上"。落盘的键必须是规范名字。
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper  # noqa: E402
+
+
+class Layer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.moe = torch.nn.Module()
+        self.moe.routed_experts = torch.nn.Module()
+        self.moe.routed_experts.inner_experts = Experts()
+
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleDict({"0": checkpoint_wrapper(Layer()), "1": checkpoint_wrapper(Layer())})
+
+
+with tempfile.TemporaryDirectory() as d:
+    model = Model()
+    raw = [n for n, _ in model.named_parameters() if "lora_" in n]
+    check("前提:named_parameters() 的名字确实带那一段",
+          all("_checkpoint_wrapped_module" in n for n in raw) and len(raw) == 4, str(raw[:1]))
+    S.save_adapters([model], d, 5)
+    with safe_open(os.path.join(d, S.shard_name(0, 5)), framework="pt") as f:
+        keys = sorted(f.keys())
+    want = sorted(
+        f"layers.{i}.moe.routed_experts.inner_experts.{n}" for i in (0, 1) for n in ("w13_lora_a", "w1_lora_b")
+    )
+    check("落盘的键是规范名字(不带包装段)", keys == want, str(keys))
+    check("和 state_dict 的键一致", set(keys) <= set(model.state_dict()), str(keys[:1]))
+
+    # merge_lora.py 认 adapter 用的正则和规范化清单,直接从那边取来对拍
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_merge_lora", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "merge_lora.py")
+    )
+    M = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(M)
+    check("merge_lora 的正则认得每一个落盘的键", all(M._ADAPTER_RE.search(k) for k in keys), str(keys[:1]))
+    check("两边的包装段清单一致", tuple(M.WRAPPER_SEGMENTS) == tuple(S.WRAPPER_SEGMENTS))
+    check("merge_lora 读旧分片时也能规范化(原名 -> 规范名)",
+          sorted(M.canonical_name(n) for n in raw) == want)
+
 print(f"\n{passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

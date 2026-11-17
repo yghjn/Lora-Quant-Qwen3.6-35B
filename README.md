@@ -154,11 +154,11 @@ verify/
 | §4.1 `mp_select.py` 挑热专家 | **代码完成**,60 项自测全过;真激活未跑过 |
 | §4.2 `--keep-hot` 跳过热专家 | **代码完成**,保留专家逐位直通已验 |
 | §4.3 混精评测 | 未做,卡被占 |
-| §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**未上卡跑过** |
-| §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),15 项自测全过;真训练未跑过 |
+| §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**2026-11-17 在另一台机器 8 卡上跑通 5 步 smoke**(原始权重 + 合成语料) |
+| §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),21 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
 | §6.6 语料 + chat template | **完成**,两条路径都冒烟过 |
-| §7.1/§7.2 `merge_lora.py` | **完成**,22 项自测全过 |
-| §6 LoRA 训练本身 | 未做,卡被占 + 训练环境未建 |
+| §7.1/§7.2 `merge_lora.py` | **完成**,26 项自测全过;读分片时会规范化参数名(旧分片也能用) |
+| §6 LoRA 训练本身 | 5 步 smoke 已跑通;**正式训练未做** —— 还差量化后的基座、真实语料、基线评测 |
 
 ### LoRA 线的三件代码就位之后,还差什么
 
@@ -566,6 +566,25 @@ python3 verify/probe_weights_map_cpu.py --hf-assets <checkpoint目录>
 ```bash
 python src/merge_lora.py --base <假量化ckpt> --adapter <adapter输出目录> --rank 16 --alpha 32 --dry-run
 ```
+
+**每次训练(包括 smoke)之后都先跑一遍 `--dry-run`。** 它是"训练保存的格式"和"合并读的格式"
+唯一一次在真产物上对接。2026-11-17 第一批真分片就在这里报了:
+
+```
+!! 有 200 个 lora_ 张量不在路由专家上 —— 训练配置和本脚本不匹配。
+   例:layers.0._checkpoint_wrapped_module.moe.routed_experts.inner_experts.w13_lora_a
+```
+
+训练时 activation checkpoint 给每一层套了一层包装,`named_parameters()` 给出的参数名中间
+多一段 `_checkpoint_wrapped_module`,而规范名字(state_dict / HF checkpoint 那边)没有。
+保存器原样写了出去,合并工具只认规范名字。adapter 本身没问题。两头都改了:
+保存器现在落规范名字;合并工具读的时候也规范化一遍,所以那批旧分片不用重训。
+
+同一处还加了一个守卫:专家参数的切分是 `(_StridedShard(dim=0, sf=<EP>), Shard(dim=0))`,
+只有 **rank 数 == EP**(我们的 8 卡 / EP=8)时才能按 rank 顺序直接拼;否则各 rank 持有的
+专家是交错的,直接拼形状照样对得上、顺序是错的 —— 现在会拒绝。
+`verify/probe_parallelize_cpu.py`(闸门 6)用并行化之后的真 DTensor 把名字和切分方式
+同合并工具对一遍,不用等训完才发现。
 
 `--alpha` **故意没有默认值**:adapter 分片(`qwen36_adapter_save.py`,格式同
 DSv4.1 的 `adapter_save.py`)的 metadata 里那个

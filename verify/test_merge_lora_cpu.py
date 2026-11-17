@@ -262,6 +262,49 @@ def main() -> int:
             p.stdout[-500:],
         )
 
+        print("\n--- 真训练出来的分片:按 rank 分片 + 名字带包装模块那一段 ---")
+        # 2026-11-17 第一批真分片长这样:每个 rank 一个文件,键是 named_parameters() 的原名
+        #   layers.0._checkpoint_wrapped_module.moe.routed_experts.inner_experts.w13_lora_a
+        # placements 是 (_StridedShard(dim=0, sf=<EP>), Shard(dim=0))。当时 merge_lora 把
+        # 200 个 adapter 全判成了"不在路由专家上"。
+        adapter = make_adapter(os.path.join(tmp, "adapter_ref.safetensors"))
+        n_ranks = 2
+
+        def make_wrapped_shards(dirpath: str, sf: int) -> None:
+            os.makedirs(dirpath, exist_ok=True)
+            per = E // n_ranks
+            for r in range(n_ranks):
+                t, meta = {}, {"step": "5", "rank": str(r)}
+                for k, v in adapter.items():
+                    _, layer, rest = k.split(".", 2)
+                    wk = f"layers.{layer}._checkpoint_wrapped_module.{rest}"
+                    t[wk] = v[r * per:(r + 1) * per].contiguous()
+                    meta[wk + ".global_shape"] = ",".join(str(x) for x in v.shape)
+                    meta[wk + ".placements"] = f"(_StridedShard(dim=0, sf={sf}), Shard(dim=0))"
+                save_file(t, os.path.join(dirpath, f"adapter_r{r:02d}_step000005.safetensors"), metadata=meta)
+
+        shard_dir = os.path.join(tmp, "shards_wrapped")
+        make_wrapped_shards(shard_dir, sf=n_ranks)
+        out_ref = os.path.join(tmp, "out_ref")
+        out_wrapped = os.path.join(tmp, "out_wrapped")
+        p1 = run("--base", base_dir, "--adapter", os.path.join(tmp, "adapter_ref.safetensors"),
+                 "--rank", str(R), "--alpha", str(ALPHA), "--out", out_ref)
+        p2 = run("--base", base_dir, "--adapter", shard_dir,
+                 "--rank", str(R), "--alpha", str(ALPHA), "--out", out_wrapped)
+        check("带包装段的分片:退出码 0", p1.returncode == 0 and p2.returncode == 0,
+              p2.stdout[-700:] + p2.stderr[-500:])
+        check("带包装段的分片:提示了名字已规范化", "已规范化" in p2.stdout, p2.stdout[-400:])
+        if p1.returncode == 0 and p2.returncode == 0:
+            a, b = read_dir(out_ref), read_dir(out_wrapped)
+            check("带包装段的分片:合并结果与单文件规范名字的逐位相同",
+                  sorted(a) == sorted(b) and all(torch.equal(a[k], b[k]) for k in a))
+
+        bad_dir = os.path.join(tmp, "shards_interleaved")
+        make_wrapped_shards(bad_dir, sf=n_ranks * 2)
+        p = run("--base", base_dir, "--adapter", bad_dir, "--rank", str(R), "--alpha", str(ALPHA), "--dry-run")
+        check("_StridedShard 的 sf != rank 数时拒绝(各 rank 的专家是交错的,直接拼顺序会错)",
+              p.returncode != 0 and "交错" in (p.stdout + p.stderr), p.stdout[-400:] + p.stderr[-400:])
+
     print(f"\n================ {_ok} 项通过, {_fail} 项失败 ================")
     return 1 if _fail else 0
 

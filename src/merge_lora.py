@@ -78,6 +78,35 @@ _ADAPTER_RE = re.compile(
 _GATE_UP_RE = re.compile(r"layers\.(\d+)\.mlp\.experts\.gate_up_proj(\.weight)?$")
 _DOWN_RE = re.compile(r"layers\.(\d+)\.mlp\.experts\.down_proj(\.weight)?$")
 _SHARD_RE = re.compile(r"adapter_r(\d+)_step(\d+)\.safetensors$")
+_STRIDED_RE = re.compile(r"_StridedShard\(dim=0,sf=(\d+)\)")
+
+# 包装模块插进参数名里的那一段。训练时 activation checkpoint 给每一层套了
+# CheckpointWrapper,`named_parameters()` 给出的名字就成了
+#   layers.0._checkpoint_wrapped_module.moe.routed_experts.inner_experts.w13_lora_a
+# 而 state_dict 里的规范名字没有中间那一段。2026-11-17 第一批真训练出来的分片就是
+# 带这一段的,本脚本当时把 200 个 adapter 全判成了"不在路由专家上"。
+# qwen36_adapter_save.py 现在写出去的是规范名字;这里读的时候也规范化一遍,
+# 所以那批旧分片照样能用。两处的清单要一致(verify/test_adapter_save_cpu.py 对拍)。
+WRAPPER_SEGMENTS = ("_checkpoint_wrapped_module", "_fsdp_wrapped_module", "_orig_mod")
+
+
+def canonical_name(name: str) -> str:
+    """去掉参数名里由包装模块引入的那几段。"""
+    return ".".join(seg for seg in name.split(".") if seg not in WRAPPER_SEGMENTS)
+
+
+def _canonicalize(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    renamed = 0
+    for k, v in tensors.items():
+        c = canonical_name(k)
+        if c in out:
+            die(f"规范化之后名字撞车:{k} -> {c}", "同一个参数被存了两份?检查 adapter 分片是怎么来的。")
+        renamed += c != k
+        out[c] = v
+    if renamed:
+        print(f"adapter: {renamed} 个张量的名字带包装模块那一段(如 _checkpoint_wrapped_module),已规范化")
+    return out
 
 
 def die(msg: str, *lines: str):
@@ -105,7 +134,7 @@ def load_adapter(path: str, step: int | None) -> dict[str, torch.Tensor]:
             for k in f.keys():  # noqa: SIM118
                 out[k] = f.get_tensor(k)
         print(f"adapter: 单文件 {path},{len(out)} 个张量")
-        return out
+        return _canonicalize(out)
 
     if not os.path.isdir(path):
         die(f"{path} 既不是文件也不是目录")
@@ -165,10 +194,22 @@ def load_adapter(path: str, step: int | None) -> dict[str, torch.Tensor]:
                 f"{k} 的 placements 是 {placements},不是专家维分片",
                 "形状碰巧对得上也不代表拼对了。用 assemble_adapter.py。",
             )
+        # 专家参数在 [efsdp, ep] 两个轴上都切 dim 0:(_StridedShard(dim=0, sf=<EP>), Shard(dim=0))。
+        # efsdp 轴大小为 1 时(rank 数 == EP,我们的 8 卡 / EP=8 就是)它不起作用,
+        # 按 rank 顺序直接拼就是对的。rank 数 != sf 说明 efsdp 轴真的切了,各 rank 持有的
+        # 专家是交错的,直接拼**形状照样对得上、顺序是错的**。
+        strided = _STRIDED_RE.search(placements)
+        if strided and int(strided.group(1)) != len(files):
+            die(
+                f"{k} 的 placements 是 {placements},但分片有 {len(files)} 个",
+                f"_StridedShard 的 sf={strided.group(1)} 应等于 rank 数才能按 rank 顺序直接拼"
+                "(否则各 rank 持有的专家是交错的)。",
+                "这种并行度本脚本不支持。用 rank 数 == EP 的配置训练,或先用 assemble_adapter.py 拼好。",
+            )
         out[k] = cat
 
     print(f"adapter: 拼成 {len(out)} 个全局张量")
-    return out
+    return _canonicalize(out)
 
 
 def group_adapter(tensors: dict[str, torch.Tensor]) -> dict[int, dict[str, torch.Tensor]]:

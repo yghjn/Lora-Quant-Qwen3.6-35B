@@ -211,6 +211,29 @@ def worker(args: argparse.Namespace) -> int:
     check("可训参数只有 adapter", not non_adapter and len(trainable) == 5 * n_layers,
           f"{len(trainable)} 个可训张量(期望 {5 * n_layers})" + (f";混入: {non_adapter[:3]}" if non_adapter else ""))
 
+    # 保存器(qwen36_adapter_save)会按这里的名字和 placements 落盘,merge_lora 照着读。
+    # 2026-11-17 第一批真分片的名字带 `_checkpoint_wrapped_module`,merge_lora 认不出来 ——
+    # 这一条用并行化之后的**真 DTensor** 把两头对一遍,不用等到训完才发现。
+    import importlib.util
+
+    from qwen36_adapter_save import canonical_name
+
+    spec_m = importlib.util.spec_from_file_location("_merge_lora", os.path.join(_SRC, "merge_lora.py"))
+    merge = importlib.util.module_from_spec(spec_m)
+    spec_m.loader.exec_module(merge)
+    adapters = [(n, p) for n, p in model.named_parameters() if "lora_" in n]
+    unknown = [n for n, _ in adapters if not merge._ADAPTER_RE.search(canonical_name(n))]
+    placements = sorted({str(p.placements).replace(" ", "") for _, p in adapters if hasattr(p, "placements")})
+
+    def _concat_ok(text: str) -> bool:
+        strided = merge._STRIDED_RE.search(text)
+        return "Shard(dim=0)" in text and (strided is None or int(strided.group(1)) == world)
+
+    check("adapter 落盘用的名字和切分方式,merge_lora 都认得",
+          bool(adapters) and not unknown and bool(placements) and all(_concat_ok(t) for t in placements),
+          f"原名例 {adapters[0][0] if adapters else '-'};placements {placements}"
+          + (f";认不出 {unknown[:2]}" if unknown else ""))
+
     print(f"{RESULT_TAG} {'PASS' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 
