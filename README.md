@@ -111,16 +111,18 @@ src/
   qwen36_lora_recipe.py    工单 §6:LoRA trainer 配置(可整体替代 MODULE)
   qwen36_lora_compat.py    converter 兼容层:已提交的 lora.py 把根配置写死成 DSv4,Qwen 过不去
   qwen36_adapter_save.py   adapter 周期落盘(原先依赖的文件在干净 clone 里不存在)
-  prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死
+  prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死 + 按 token 丢掉训练装不下的
+  gen_trace.py             工单 §6.6:让基线模型自己生成推理轨迹当训练语料(移植自 DSv4.1)
   merge_lora.py            工单 §7.1/§7.2:adapter 合并回 bf16 checkpoint
   mp_select.py             工单 §4.1:按路由计数挑热专家 + 位宽账(--bits-table)
 verify/
   test_core_cpu.py         内核自测,24 项,纯 CPU
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
-  test_merge_lora_cpu.py   合并自测,22 项,纯 CPU,参考值用 einsum 独立算
+  test_merge_lora_cpu.py   合并自测,26 项,纯 CPU,参考值用 einsum 独立算
+  test_gen_trace_cpu.py    轨迹生成自测,28 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
-  test_adapter_save_cpu.py adapter 落盘自测,15 项,只需 torch + safetensors
+  test_adapter_save_cpu.py adapter 落盘自测,21 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
   probe_recipe_cpu.py      训练配置能否 import / 构造(需训练环境;安装脚本的闸门 5)
   probe_parallelize_cpu.py 8 个 CPU 进程把整个模型真的并行化一遍(安装脚本的闸门 6)
@@ -156,7 +158,7 @@ verify/
 | §4.3 混精评测 | 未做,卡被占 |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**2026-11-17 在另一台机器 8 卡上跑通 5 步 smoke**(原始权重 + 合成语料) |
 | §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),21 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
-| §6.6 语料 + chat template | **完成**,两条路径都冒烟过 |
+| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,28 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,26 项自测全过;读分片时会规范化参数名(旧分片也能用) |
 | §6 LoRA 训练本身 | 5 步 smoke 已跑通;**正式训练未做** —— 还差量化后的基座、真实语料、基线评测 |
 
@@ -531,7 +533,8 @@ MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
 模板若带 `{%- generation %}` 标签(Hub 上较新的版本有),上游的 jinja 环境不认,
 训练建 tokenizer 时会报 `TemplateSyntaxError`;`prepare_corpus.py` 会先报出来并说明处理办法。
 
-**未决**:用 Qwen3.6 的模板渲出来,prompt 段到 `<|im_start|>assistant\n<think>\n` 为止,
+**已有解法(见"正式训练的语料"一节:自生成轨迹带真实的推理)。** 原来的问题是:
+用 Qwen3.6 的模板渲出来,prompt 段到 `<|im_start|>assistant\n<think>\n` 为止,
 算 loss 的部分是 `\n</think>\n\n<回答><|im_end|>` —— 即**每条样本都在教模型输出一个空的
 思考块**。冒烟无所谓;交付训练前要确认这和评测时的思考开关是否一致。
 
@@ -592,6 +595,66 @@ DSv4.1 的 `adapter_save.py`)的 metadata 里那个
 放大了 8 倍(训练日志 alpha=4,评测照默认值传了 32),那批 `3bit+LoRA`
 参照数因此全部不可用。合并后的 `merge_info.json` 和分片 metadata 里会
 记下实际用的 scaling,评测端照它核对。
+
+## 正式训练的语料:让基线模型自己生成
+
+DSv4.1 的 LoRA 用的不是公开数据集,而是**未量化的基线模型自己生成的推理轨迹**
+(`reason_trace*`,527–1574 条 / 1.2–2.8 M token)。道理很直接:adapter 要补偿的是
+"量化后的模型"和"原模型"的差,最直接的监督信号就是原模型自己的输出。
+
+那批数据本身**不能拿来训 Qwen** —— 回答是 DeepSeek 的输出,文本里还拼着 DeepSeek 的
+对话标记。能复用的是**提问**(与模型无关)和方法。`src/gen_trace.py` 是移植过来的版本:
+
+```bash
+python src/gen_trace.py --prompts <提问文件> --out <工作目录>/traces.jsonl --url http://localhost:8900/v1/chat/completions --model <服务里的模型名> --n 1000 --max-tokens 3072 --exclude <评测集题目文件>
+```
+
+```bash
+python src/prepare_corpus.py --tokenizer <checkpoint目录> --src <工作目录>/traces.jsonl --seq-len 4096 --out <工作目录>/corpus.jsonl
+```
+
+然后 `DATA_FILES=<工作目录>/corpus.jsonl` 起训练。
+
+**前提:一个 OpenAI 兼容的 chat 服务,背后是原始 bf16 权重的 Qwen3.6**(`vllm serve` 那种)。
+本仓库的评测工具用的是进程内引擎,没有现成的 HTTP 服务;`vllm serve` 在这套 NPU 环境上
+怎么起**没有验证过**。它和 bf16 基线评测要的是同一份权重、同一批卡,可以排在一起。
+
+几条要紧的:
+
+* **提问从哪来。** DSv4.1 的提问在同事 `l84414662` 的目录里(开发机
+  `dsv4/unisvq/data/calib/` 和 `data/trace_ds*`)。`--prompts` 直接认那种
+  `{"text": "<|User|>…<|Assistant|>…"}` 格式(ASCII 和全角标记都认,只取 User 段),
+  **不需要把文件拷进本仓库**;用不用、拷不拷由人定。也认 `messages` / `prompt` /
+  `question` / `instruction`+`input`。
+* **评测题不能进训练语料**,否则复评的分数不能信。`--exclude` 给评测集的题目文件
+  (MMLU-Pro / MATH-500 / LiveCodeBench),撞上的会被剔除。只做了去空白、不分大小写的
+  全文比对,改写过的同一道题拦不住。不给 `--exclude` 时脚本会明说没查。
+* **`--max-tokens` 要和训练的 seq_len 对齐。** 上游 `ChatDataset` 对超过 seq_len 的样本是
+  **静默丢弃**,不截断(实测:256 的 seq_len 下,一条 2400 字符推理的样本直接没了,日志里
+  只有一条 debug)。DSv4.1 那批推理 token 的中位是 2527、p75 是 5674,照搬 8192 的上限,
+  在我们 seq_len=4096 的配置下大半会被丢。默认 3072;`prepare_corpus.py --seq-len 4096`
+  会用真 tokenizer 数出装得下的条数和 token 合计,并提前把装不下的丢掉。
+  **这里有一个取舍**:DSv4.1 的结论是"语料的杠杆是轨迹长度 + 自己收尾"。想要更长的轨迹,
+  得连训练的 seq_len 一起加,显存跟着涨。
+* **截断的轨迹默认丢掉**(`finish_reason == "length"`):它们教的是"不收尾"。没有推理、
+  没有答案的也丢。跑完会打出截断率,偏高说明 `--max-tokens` 对这批提问太小、留下来的
+  偏向短轨迹。
+* **不碰模板。** 输出是 `messages`(assistant 那条带 `reasoning_content`),生成时模板由
+  服务端套,训练时由上游套,用的都是 checkpoint 目录里那一份。DSv4.1 版自己拼文本,
+  角色标记写错成 ASCII 的那个坑(+13.1 点 -> +3.5 点)在这里不会发生。
+* **顺带解决了"空思考块"**:自生成的轨迹带真实的推理,渲出来是
+  `<think>\n推理\n</think>\n\n答案`,和开着思考模式的评测一致。
+* 采样参数默认是评测那边的(0.6 / 0.95 / top_k 20),不是 DSv4.1 的 1.0 / 0.95。
+* 请求 localhost 时不走代理(不改环境变量,只是这一个请求不用代理)。
+
+**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(28 项)。
+另外把产物用**真的 Qwen3.6 tokenizer 和模板**过了一遍上游的 `ChatDataset`:带推理的样本,
+没被屏蔽的 label 解出来正是"推理 + 答案",提问部分被屏蔽。**没验到的**:对着真的服务生成、
+`vllm serve` 返回的推理在哪个字段(`reasoning_content` / `reasoning` / 留在 content 里
+三种都处理了,但没对真服务试过)。
+
+规模参考:DSv4.1 最大一版 2.8 M token,且因为数据不够把 rank 降到了 2。我们的正式配置
+(256 步 × 每步 8 条 × 4096)最多能吃 8.4 M token;语料少就用 `qwen36_35b_a3b_lora_r4`。
 
 ## §0.1 闸门怎么跑(从零开始的完整流程)
 

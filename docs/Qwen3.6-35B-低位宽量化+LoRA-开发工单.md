@@ -492,7 +492,7 @@ EP=1 所以全局专家号就是 0..255,**加载侧必须用同一个编号方�
 | 6.3 | 优化器 AdamW,Muon profile 置 None | 不报 `matched no parameters` |
 | 6.4 | 初始权重 = 阶段 2.5 的 bf16 checkpoint,HF 格式、model-only | 日志无"保持随机初始化" |
 | 6.5 | `adapter_save.py` 原样复用,设 `ADAPTER_SAVE_DIR` 和 `ADAPTER_SAVE_EVERY` | 日志 `adapter 保存已注册`;落盘分片数 == world_size |
-| 6.6 | 语料:先用公开指令数据跑通;要自生成轨迹再用 `gen_trace.py`,**把 DeepSeek 的全角标记换成 Qwen 的 `apply_chat_template`**,并在输出里报告实际用了哪种 | "chat template 成功"必须 100%,回退 0 |
+| 6.6 | 语料:先用公开指令数据跑通;要自生成轨迹再用 `gen_trace.py`,**把 DeepSeek 的全角标记换成 Qwen 的 `apply_chat_template`**,并在输出里报告实际用了哪种。**2026-11-17 已移植**(`src/gen_trace.py`):输出改成 `messages` + `reasoning_content`,脚本自己不碰模板;`--max-tokens` 默认 3072,因为上游对超过 seq_len 的样本是静默丢弃。见 README"正式训练的语料" | "chat template 成功"必须 100%,回退 0;`prepare_corpus.py --seq-len` 报告的"超过 seq_len"要看一眼 —— 那是训练根本看不到的部分 |
 
 **6.6 的坑有实测代价。** DSv4.1 两个模型目录的 `tokenizer.chat_template`
 **根本没设**,脚本一路静默回退成 5 个 ASCII 字面 token,

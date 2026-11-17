@@ -211,7 +211,13 @@ def normalize(sample) -> list[dict] | None:
             if not isinstance(role, str) or not isinstance(content, str):
                 return None
             role = {"human": "user", "gpt": "assistant"}.get(role, role)
-            out.append({"role": role, "content": content})
+            item = {"role": role, "content": content}
+            # 自生成轨迹(gen_trace.py)把模型的推理放在 reasoning_content 里。
+            # Qwen 的模板认这个字段,会把推理渲进 <think> 和 </think> 之间,后面跟答案。
+            reasoning = m.get("reasoning_content")
+            if role == "assistant" and isinstance(reasoning, str) and reasoning.strip():
+                item["reasoning_content"] = reasoning
+            out.append(item)
         return out
 
     if isinstance(sample.get("prompt"), str) and isinstance(sample.get("response"), str):
@@ -262,6 +268,11 @@ def main() -> int:
     ap.add_argument("--synthetic", type=int, default=0, help="再补 N 条内置样本(给冒烟用)")
     ap.add_argument("--out", help="输出 jsonl;不给就只做模板检查")
     ap.add_argument("--max-chars", type=int, default=0, help=">0 时丢掉超长样本")
+    ap.add_argument(
+        "--seq-len", type=int, default=0,
+        help=">0 时按 token 数丢掉训练装不下的样本(上游 ChatDataset 对超过 seq_len 的样本是"
+             "直接丢弃,不截断)。填训练配置的 seq_len,现在是 4096。需要 tokenizers 包",
+    )
     ap.add_argument("--skip-bad", action="store_true", help="认不出来的样本跳过而不是报错退出")
     args = ap.parse_args()
 
@@ -360,8 +371,28 @@ def main() -> int:
     if not kept:
         _die("一条样本都没有。", "给 --src,或者用 --synthetic N 生成内置样本跑冒烟。")
 
+    # 数 token 用的 tokenizer。上游(text_datasets.py 的 _tokenize_sample)的判据是
+    # "整段渲染结果去掉结尾换行、编码、补上 EOS 之后,len - 1 > seq_len 就丢"。
+    tok = None
+    if args.seq_len > 0:
+        tok_path = os.path.join(args.tokenizer, "tokenizer.json")
+        try:
+            from tokenizers import Tokenizer
+
+            tok = Tokenizer.from_file(tok_path)
+        except ImportError:
+            _die("--seq-len 需要 tokenizers 包。", "训练环境里有;或者去掉 --seq-len(那样就不数 token 了)。")
+        except Exception as exc:  # noqa: BLE001
+            _die(f"读不了 {tok_path}", str(exc))
+
     # 每条都真渲一遍 —— 工单 §6.6 的验收是"chat template 成功必须 100%,回退 0"。
     failed = 0
+    rendered_total = len(kept)
+    with_reasoning = 0
+    reasoning_lost = 0
+    over_len = 0
+    ntoks: list[int] = []
+    fitted: list[list[dict]] = []
     for msgs in kept:
         try:
             text = render_check(template, msgs)
@@ -370,6 +401,37 @@ def main() -> int:
             continue
         if not text.strip():
             failed += 1
+            continue
+        reasoning = msgs[-1].get("reasoning_content")
+        if reasoning:
+            with_reasoning += 1
+            # 模板不认 reasoning_content 的话,推理会被静默丢掉,只剩一个空的思考块
+            if reasoning.strip()[:200] not in text:
+                reasoning_lost += 1
+        if tok is not None:
+            n = len(tok.encode(text.rstrip(chr(10))).ids)
+            if n > args.seq_len:  # 上游:补 EOS 后 len-1 > seq_len 即丢,等价于 n > seq_len
+                over_len += 1
+                continue
+            ntoks.append(n)
+        fitted.append(msgs)
+    kept = fitted
+
+    if reasoning_lost:
+        _die(
+            f"{reasoning_lost}/{with_reasoning} 条样本的 reasoning_content 没出现在渲染结果里。",
+            "这份 chat template 不认 reasoning_content —— 推理会被静默丢掉,训练时只剩空的思考块。",
+            "确认用的是 Qwen3.6 自己的模板。",
+        )
+    if not kept:
+        _die("一条样本都没剩下。", f"渲染失败 {failed} 条,超过 --seq-len 的 {over_len} 条。")
+
+    # 有任何一条带推理时,给每条 assistant 消息都写上 reasoning_content(没有的写空串)。
+    # datasets 读 json 是按块推断结构的,同一个字段有的行有、有的行没有,出现在后面的块里
+    # 会报结构不一致。空串渲出来和不带这个字段完全一样(都是空的思考块)。
+    if with_reasoning:
+        for msgs in kept:
+            msgs[-1].setdefault("reasoning_content", "")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:
@@ -387,11 +449,21 @@ def main() -> int:
     print(f"认不出:      {bad}" + ("  (已跳过)" if args.skip_bad else ""))
     print(f"不是单轮:    {not_single}" + ("  (已跳过)" if args.skip_bad and not_single else ""))
     print(f"超长丢弃:    {too_long}")
+    if args.seq_len > 0:
+        print(f"超过 seq_len: {over_len}  (token 数 > {args.seq_len},训练时会被上游直接丢弃,这里先丢掉)")
+    print(f"带推理:      {with_reasoning}" + ("" if with_reasoning else "  (全部是空思考块)"))
     print(f"内置补充:    {args.synthetic}")
     print(f"写出:        {len(kept)}  -> {args.out}")
     print(f"角色分布:    {roles}")
     print(f"总字符:      {chars}  (平均 {chars / len(kept):.0f}/条)")
-    print(f"chat template 成功: {len(kept) - failed}/{len(kept)}   回退/失败: {failed}")
+    print(f"chat template 成功: {rendered_total - failed}/{rendered_total}   回退/失败: {failed}")
+
+    if ntoks:
+        v = sorted(ntoks)
+        n = len(v)
+        print(f"token 数/条: min {v[0]} p25 {v[n // 4]} 中位 {v[n // 2]} p75 {v[3 * n // 4]} max {v[-1]}")
+        print(f"token 合计:  {sum(v) / 1e6:.2f} M  (256 步 × 每步 8 条 × {args.seq_len} 最多能吃 "
+              f"{256 * 8 * args.seq_len / 1e6:.1f} M)")
 
     if failed:
         _die(f"{failed} 条渲染失败 —— 工单 §6.6 的验收要求是 0。")
