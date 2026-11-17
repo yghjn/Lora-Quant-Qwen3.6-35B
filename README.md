@@ -120,7 +120,7 @@ verify/
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,26 项,纯 CPU,参考值用 einsum 独立算
-  test_gen_trace_cpu.py    轨迹生成自测,44 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
+  test_gen_trace_cpu.py    轨迹生成自测,50 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
   test_adapter_save_cpu.py adapter 落盘自测,21 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
@@ -158,7 +158,7 @@ verify/
 | §4.3 混精评测 | 未做,卡被占 |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**2026-11-17 在另一台机器 8 卡上跑通 5 步 smoke**(原始权重 + 合成语料) |
 | §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),21 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
-| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,44 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
+| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,50 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,26 项自测全过;读分片时会规范化参数名(旧分片也能用) |
 | §6 LoRA 训练本身 | 5 步 smoke 已跑通;**正式训练未做** —— 还差量化后的基座、真实语料、基线评测 |
 
@@ -533,7 +533,7 @@ MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
 模板若带 `{%- generation %}` 标签(Hub 上较新的版本有),上游的 jinja 环境不认,
 训练建 tokenizer 时会报 `TemplateSyntaxError`;`prepare_corpus.py` 会先报出来并说明处理办法。
 
-**已有解法(见"正式训练的语料"一节:自生成轨迹带真实的推理)。** 原来的问题是:
+**已定(2026-11-17):这不是问题,正是我们的评测要的格式** —— 评测是关思考跑的,生成提示本来就以空的思考块结尾。见"正式训练的语料"里的"思考开关"。(中间一度写成"带推理的轨迹能解决它",那是照搬 DSv4.1 开思考评测的结论,对我们不成立。)原来的描述是:
 用 Qwen3.6 的模板渲出来,prompt 段到 `<|im_start|>assistant\n<think>\n` 为止,
 算 loss 的部分是 `\n</think>\n\n<回答><|im_end|>` —— 即**每条样本都在教模型输出一个空的
 思考块**。冒烟无所谓;交付训练前要确认这和评测时的思考开关是否一致。
@@ -606,7 +606,7 @@ DSv4.1 的 LoRA 用的不是公开数据集,而是**未量化的基线模型自�
 对话标记。能复用的是**提问**(与模型无关)和方法。`src/gen_trace.py` 是移植过来的版本:
 
 ```bash
-python src/gen_trace.py --prompts <提问文件> --out <工作目录>/traces.jsonl --url http://127.0.0.1:8900/v1/chat/completions --model <服务里的模型名> --n 1000 --max-tokens 3072 --exclude <评测集题目文件>
+python src/gen_trace.py --prompts <提问文件> --out <工作目录>/traces.jsonl --url http://127.0.0.1:8901/v1/chat/completions --model qwen36 --thinking off --n 1000 --max-tokens 3072 --exclude <评测集题目文件>
 ```
 
 ```bash
@@ -643,9 +643,68 @@ sha256 `4a3c9264814b2f81c6f36f285cf13202952d71247e162c168950e6555fa492b0`。
 python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --exclude <release_v6 目录> --n 0 --dump-prompts prompts_clean_for_release_v6.jsonl
 ```
 
-**前提:一个 OpenAI 兼容的 chat 服务,背后是原始 bf16 权重的 Qwen3.6**(`vllm serve` 那种)。
-本仓库的评测工具用的是进程内引擎,没有现成的 HTTP 服务;`vllm serve` 在这套 NPU 环境上
-怎么起**没有验证过**。它和 bf16 基线评测要的是同一份权重、同一批卡,可以排在一起。
+### 先起模型服务
+
+`gen_trace.py` 只是客户端。要先有一个 OpenAI 兼容的 chat 服务,背后是**原始 bf16 权重**的
+Qwen3.6(不是量化后的目录 —— 轨迹必须来自未量化的模型)。在**装了 vLLM 的那个环境**里起
+(评测用的那个,不是 `lqq-train`),并先把评测工具的环境变量带上:
+
+```bash
+cd <eval_qwen3.6-35b_vllm 目录> && HIF4_MODE=off source scripts/env.sh
+```
+
+```bash
+vllm serve <原始 checkpoint 目录> --host 127.0.0.1 --port 8901 --served-model-name qwen36 --dtype bfloat16 --trust-remote-code --tensor-parallel-size 8 --enable-expert-parallel --max-model-len 8192 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --enforce-eager --reasoning-parser qwen3
+```
+
+起来之后日志里会有 `Application startup complete`。再开一个终端确认:
+
+```bash
+curl --noproxy '*' http://127.0.0.1:8901/v1/models
+```
+
+**这条命令没有在 Qwen3.6 上跑过。** 每个参数的出处:
+
+| 参数 | 出处 |
+|---|---|
+| `--dtype bfloat16 --trust-remote-code --tensor-parallel-size 8 --enable-expert-parallel --gpu-memory-utilization 0.90 --max-num-batched-tokens 8192 --enforce-eager` | 评测工具建引擎时用的就是这些(`evalkit/engine.py` 的 `build_llm`),基线评测是这样跑通的 |
+| `--host --port --served-model-name --max-model-len --max-num-seqs --reasoning-parser` 这些参数名 | 同事 2026-11-17 在开发机上跑着的 DSv4.1 服务用的是同一组(`vllm serve … --port 8900 …`),说明 `vllm serve` 在这套 NPU 环境上能起 |
+| `--reasoning-parser qwen3` | 这个版本的 vLLM(0.18.1)里有这个名字(`vllm/reasoning/qwen3_reasoning_parser.py`)。报不认识就去掉,`gen_trace.py` 也认"推理留在正文里"的返回 |
+| `--max-model-len 8192` | 提问(最长 6000 字符)+ 3072 的生成上限,留了余量。评测默认的 65536 用不着,KV cache 白占 |
+| `scripts/env.sh` | 它设的几个变量是这套环境上跑 vLLM 的前提:`VLLM_WORKER_MULTIPROC_METHOD=spawn`(否则 worker 起来就崩,看着像卡住)、`TORCH_DEVICE_BACKEND_AUTOLOAD=0`、CANN 的环境、HCCL 的缓冲区 |
+
+三处**不要照抄同事那条命令**:
+
+* **不要加 `--limit-mm-per-prompt '{"image":0,"video":0}'`。** 对 Qwen3.5/3.6 这会让前向直接崩
+  (`'NoneType' object has no attribute 'size'`),评测工具里专门记了这个坑。
+* **不要加 `--quantization ascend`、`--tokenizer-mode deepseek_v41`。** 那是 DSv4.1 的 int8 基座和它自己的 tokenizer。
+* **`HIF4_MODE=off`。** 评测工具的 HiFloat4 插件开着的话,服务里的权重就不是原始的 bf16 了。
+
+它和 bf16 基线评测要的是同一份权重、同一批卡,但评测工具用的是进程内引擎,不走这个服务;
+两者只能先后占卡。
+
+### 思考开关:`--thinking` 必须和评测的方式一致
+
+Qwen3.6 的模板在生成提示的结尾有两种写法,训练样本渲出来也有两种,各自只和其中一种对得上
+(用真模板核对过):
+
+| | 生成提示的结尾 | 对得上的训练样本 |
+|---|---|---|
+| 关思考 | `…assistant\n<think>\n\n</think>\n\n` | assistant **不带** `reasoning_content`:`<think>\n\n</think>\n\n答案` |
+| 开思考(模板默认) | `…assistant\n<think>\n` | assistant 带 `reasoning_content`:`<think>\n推理\n</think>\n\n答案` |
+
+**本项目的评测默认是关思考的**(`eval_qwen3.6-35b_vllm/scripts/run_arm.sh` 的
+`THINK_FLAG=--no-thinking`,MMLU-Pro / MATH-500 / LiveCodeBench 都是。理由写在那个脚本里:
+这个模型系列开着思考再加有限的 token 上限,分数量的是"能不能收尾")。所以:
+
+* **用 `--thinking off`**:基线模型直接作答,样本里没有推理,渲出来正是评测时模型面对的格式。
+* `--thinking on` 是 DSv4.1 的做法 —— 他们的评测是开思考的。评测方式改了才用它
+  (比如 LiveCodeBench 换成 `qwen-official` 协议,那个强制开思考)。
+* 两种可以各生成一份,`prepare_corpus.py --src a.jsonl --src b.jsonl` 合起来。
+* `--thinking` **没有默认值**,生成时不给就报错:选错了不会有任何报错,只是语料和评测对不上。
+* `--thinking off` 时回来的结果如果仍带推理,说明服务端的模板没理会开关,这种样本丢掉并计数。
+
+关思考之后,下面"`--max-tokens` 要和 seq_len 对齐"那一条压力小很多:没有推理,回答短得多。
 
 几条要紧的:
 
@@ -675,8 +734,9 @@ python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --exclude <releas
 * **不碰模板。** 输出是 `messages`(assistant 那条带 `reasoning_content`),生成时模板由
   服务端套,训练时由上游套,用的都是 checkpoint 目录里那一份。DSv4.1 版自己拼文本,
   角色标记写错成 ASCII 的那个坑(+13.1 点 -> +3.5 点)在这里不会发生。
-* **顺带解决了"空思考块"**:自生成的轨迹带真实的推理,渲出来是
-  `<think>\n推理\n</think>\n\n答案`,和开着思考模式的评测一致。
+* **"空思考块"不是问题。** 之前担心"每条样本都在教模型输出空思考块";其实关思考评测时
+  生成提示本来就以空思考块结尾,样本渲成 `<think>\n\n</think>\n\n答案` 正好对上。
+  带推理的样本(`<think>\n推理\n</think>\n\n答案`)对应的是开思考的评测。见上面"思考开关"。
 * 采样参数默认是评测那边的(0.6 / 0.95 / top_k 20),不是 DSv4.1 的 1.0 / 0.95。
 * 请求本机地址时不走代理(不改环境变量,只是这一个请求不用代理)。
 * **`--url` 用 `127.0.0.1`,不要用 `localhost`。** 2026-11-17 第一次对着真环境跑,50 条提问
@@ -685,7 +745,7 @@ python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --exclude <releas
   服务没起来、模型名不对就直接停并说明是哪种情况,不发提问、不留空文件;碰到上面这种
   情况会自动改用 `127.0.0.1`。
 
-**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(44 项)。
+**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(50 项)。
 另外把产物用**真的 Qwen3.6 tokenizer 和模板**过了一遍上游的 `ChatDataset`:带推理的样本,
 没被屏蔽的 label 解出来正是"推理 + 答案",提问部分被屏蔽。**没验到的**:对着真的服务生成、
 `vllm serve` 返回的推理在哪个字段(`reasoning_content` / `reasoning` / 留在 content 里

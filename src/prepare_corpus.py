@@ -451,7 +451,7 @@ def main() -> int:
     print(f"超长丢弃:    {too_long}")
     if args.seq_len > 0:
         print(f"超过 seq_len: {over_len}  (token 数 > {args.seq_len},训练时会被上游直接丢弃,这里先丢掉)")
-    print(f"带推理:      {with_reasoning}" + ("" if with_reasoning else "  (全部是空思考块)"))
+    print(f"带推理:      {with_reasoning}" + ("" if with_reasoning else "  (都是「空思考块 + 答案」,即关思考的格式)"))
     print(f"内置补充:    {args.synthetic}")
     print(f"写出:        {len(kept)}  -> {args.out}")
     print(f"角色分布:    {roles}")

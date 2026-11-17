@@ -75,6 +75,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             message = {"role": "assistant", "content": "", "reasoning_content": "只有推理"}
         elif "CASE_LONG" in q:
             message = {"role": "assistant", "content": "答案L", "reasoning_content": "很长 " * 400}
+        # 关思考:真的服务这时只回答案、不带推理。CASE_IGNORES_SWITCH 模拟模板不理会开关。
+        if (body.get("chat_template_kwargs") or {}).get("enable_thinking") is False \
+                and "CASE_IGNORES_SWITCH" not in q:
+            content = (message.get("content") or "").split("</think>")[-1].strip()
+            message = {"role": "assistant", "content": content}
         payload = json.dumps({
             "choices": [{"message": message, "finish_reason": finish}],
             "usage": {"completion_tokens": 30, "completion_tokens_details": {"reasoning_tokens": 20}},
@@ -87,6 +92,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def run(script: str, *argv: str) -> subprocess.CompletedProcess:
+    # --thinking 没有默认值。这里的用例除了专门测它的那一组,都按"开思考"(带推理轨迹)跑。
+    if script == GEN and "--thinking" not in argv and "--dump-prompts" not in argv and "--out" in argv:
+        argv = (*argv, "--thinking", "on")
     cmd = [sys.executable] + (["-I"] if sys.flags.isolated else []) + [script, *argv]
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
 
@@ -295,6 +303,51 @@ def main() -> int:
                 "--out", empty_out)
         check("--out 是个空文件时不用 --resume 也能跑(上次失败留下的)",
               p.returncode == 0 and len(read_jsonl(empty_out)) == 6, p.stdout[-300:] + p.stderr[-300:])
+
+        print("\n--- 思考开关:要和评测的方式一致 ---")
+        # 本项目的评测默认关思考。关思考时生成提示以空的 <think></think> 结尾,模型直接作答;
+        # 与之对应的训练样本是"不带 reasoning_content 的 assistant"。
+        p = subprocess.run([sys.executable, GEN, "--prompts", prompts, "--url", url, "--model", "fake",
+                            "--out", os.path.join(tmp, "nothink_flag.jsonl")],
+                           capture_output=True, text=True, encoding="utf-8")
+        check("生成时不给 --thinking 报用法错误(没有默认值)", p.returncode != 0 and "--thinking" in p.stderr,
+              p.stderr[-300:])
+        off_prompts = os.path.join(tmp, "off_prompts.jsonl")
+        with open(off_prompts, "w", encoding="utf-8") as fh:
+            for row in ({"prompt": "关思考的普通提问" + PAD},
+                        {"prompt": "CASE_FIELD_REASONING 关思考时也不该带推理" + PAD},
+                        {"prompt": "CASE_IGNORES_SWITCH 服务端不理会开关" + PAD},
+                        {"prompt": "CASE_NOANSWER 没有答案" + PAD}):
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        off_out = os.path.join(tmp, "traces_off.jsonl")
+        n_req = len(RECEIVED)
+        p = run(GEN, "--prompts", off_prompts, "--url", url, "--model", "fake", "--n", "0",
+                "--thinking", "off", "--out", off_out)
+        got_off = read_jsonl(off_out) if os.path.exists(off_out) else []
+        sent = RECEIVED[n_req:]
+        check("--thinking off:请求里带 chat_template_kwargs={enable_thinking: false}",
+              p.returncode == 0 and len(sent) == 4
+              and all((b.get("chat_template_kwargs") or {}).get("enable_thinking") is False for b in sent),
+              p.stdout[-400:] + p.stderr[-300:])
+        check("--thinking off:写出的样本没有 reasoning_content,并标了 thinking=off",
+              len(got_off) == 2 and all("reasoning_content" not in r["messages"][1] and r["thinking"] == "off"
+                                        for r in got_off), str(got_off)[:300])
+        check("--thinking off:服务端不理会开关(仍带推理)的那条被丢掉并计数",
+              not any("CASE_IGNORES_SWITCH" in r["messages"][0]["content"] for r in got_off)
+              and "关思考没生效 1" in p.stdout, p.stdout[-500:])
+        check("--thinking on 的请求不带 chat_template_kwargs",
+              all("chat_template_kwargs" not in b for b in RECEIVED[:n_req]))
+        corpus_off = os.path.join(tmp, "corpus_off.jsonl")
+        tok_off = os.path.join(tmp, "tok_off")
+        os.makedirs(tok_off)
+        with open(os.path.join(tok_off, "chat_template.jinja"), "w", encoding="utf-8") as fh:
+            fh.write(TEMPLATE)
+        p = run(PREP, "--tokenizer", tok_off, "--src", off_out, "--out", corpus_off)
+        rows_off = read_jsonl(corpus_off) if os.path.exists(corpus_off) else []
+        check("关思考的产物过 prepare_corpus:2 条,都不带 reasoning_content",
+              p.returncode == 0 and len(rows_off) == 2
+              and all("reasoning_content" not in m for r in rows_off for m in r["messages"]),
+              p.stdout[-300:] + p.stderr[-300:])
 
         print("\n--- 断点续跑 ---")
         p = run(GEN, *common)

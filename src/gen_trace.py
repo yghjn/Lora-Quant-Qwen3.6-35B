@@ -3,7 +3,7 @@
 
     python src/gen_trace.py --prompts <提问文件> --out traces.jsonl \\
         --url http://127.0.0.1:8900/v1/chat/completions --model <服务里的模型名> \\
-        --n 1000 --max-tokens 3072
+        --thinking off --n 1000 --max-tokens 3072
 
     python src/prepare_corpus.py --tokenizer <checkpoint 目录> --src traces.jsonl \\
         --seq-len 4096 --out corpus.jsonl          # 验模板、数 token、丢掉训练装不下的
@@ -32,6 +32,28 @@ DeepSeek 的输出,用它训等于教 Qwen 模仿另一个模型。能从那边�
 * **在整个提问文件里均匀抽样**,不取前 N 条:提问文件往往是按领域拼起来的,
   顺序取会偏向排在前面的领域。
 * 提问长度 40–6000 字符:太短没信息,太长会挤掉生成预算。
+
+`--thinking on|off`:必须和评测的方式一致(没有默认值)
+----------------------------------------------------
+Qwen3.6 的模板在生成提示的结尾有两种写法(用真模板核对过):
+
+    开思考(模板的默认)   ...<|im_start|>assistant\\n<think>\\n
+    关思考                 ...<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n
+
+训练样本渲出来也有两种,各自只和其中一种提示对得上:
+
+    assistant 带 reasoning_content   ...assistant\\n<think>\\n推理\\n</think>\\n\\n答案     <- 开思考
+    assistant 不带                   ...assistant\\n<think>\\n\\n</think>\\n\\n答案         <- 关思考
+
+**本项目的评测默认是关思考的**(`eval_qwen3.6-35b_vllm/scripts/run_arm.sh` 的
+`THINK_FLAG=--no-thinking`,三个评测都是;理由是这个模型系列开着思考再加有限的 token
+上限,分数量的是"能不能收尾")。所以和评测一致的语料是 `--thinking off`:让基线模型
+直接作答,样本里没有推理。`--thinking on` 是 DSv4.1 的做法 —— 他们的评测是开思考的。
+评测方式改了(比如 LiveCodeBench 用 qwen-official 协议,强制开思考),语料要跟着改;
+也可以两种各生成一份,`prepare_corpus.py --src a --src b` 合起来。
+
+`--thinking off` 时,回来的结果如果仍然带推理,说明服务端的模板没理会开关;这种样本
+丢掉并计数(评测工具那边也是按渲染结果断言的,不信这个参数)。
 
 和 DSv4.1 版本不一样的地方
 --------------------------
@@ -374,6 +396,9 @@ def ask(opener, args, question: str) -> dict:
     }
     if args.top_k > 0:
         body["top_k"] = args.top_k
+    if args.thinking == "off":
+        # 交给服务端的模板:生成提示以 `<think>\n\n</think>\n\n` 结尾,模型直接作答
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     req = urllib.request.Request(
         args.url, json.dumps(body).encode("utf-8"), {"Content-Type": "application/json"}
     )
@@ -394,6 +419,10 @@ def main() -> int:
     ap.add_argument("--dump-prompts", metavar="FILE",
                     help="只做到「筛选 + 去重 + 排除评测题 + 抽样」为止,把提问写成 jsonl 就退出,不请求服务。"
                          "用来先把一份干净的提问文件定下来")
+    ap.add_argument("--thinking", choices=("on", "off"),
+                    help="生成时开不开思考(生成时必填,没有默认值)。**要和评测的方式一致**:"
+                         "本项目的评测默认关思考(eval 的 THINK_FLAG=--no-thinking),对应 off —— "
+                         "模型直接作答,样本里没有推理;on 是 DSv4.1 的做法,样本带推理轨迹")
     ap.add_argument("--n", type=int, default=1000, help="抽多少条提问(默认 1000;0 = 全部)")
     ap.add_argument("--seed", type=int, default=0, help="抽样的随机种子")
     ap.add_argument("--max-tokens", type=int, default=3072,
@@ -413,6 +442,9 @@ def main() -> int:
     args = ap.parse_args()
     if not args.dump_prompts and not (args.out and args.model):
         ap.error("生成时 --out 和 --model 都要给(只想导出提问文件就用 --dump-prompts)")
+    if not args.dump_prompts and not args.thinking:
+        ap.error("生成时 --thinking on|off 必须给,没有默认值:它要和评测的方式一致。"
+                 "本项目的评测默认关思考,对应 --thinking off")
 
     prompts, stats = load_prompts(args.prompts, args.min_chars, args.max_chars)
     print("=== 提问 ===")
@@ -464,7 +496,7 @@ def main() -> int:
     else:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
 
-    print(f"\n=== 生成 ===\n  {args.url}  model={args.model}  max_tokens={args.max_tokens}  "
+    print(f"\n=== 生成 ===\n  {args.url}  model={args.model}  思考={args.thinking}  max_tokens={args.max_tokens}  "
           f"temperature={args.temperature} top_p={args.top_p} top_k={args.top_k}  并发 {args.par}")
     if not prompts:
         print("  没有要问的了。")
@@ -474,7 +506,8 @@ def main() -> int:
         preflight(args)  # 连不上就在这里停,不发提问、不建文件;可能把 localhost 改成 127.0.0.1
     opener = _opener(args.url)
     lock = threading.Lock()
-    counts = {"写出": 0, "截断": 0, "没有推理": 0, "没有答案": 0, "请求失败": 0}
+    counts = {"写出": 0, "截断": 0, "没有推理": 0, "没有答案": 0, "关思考没生效": 0, "请求失败": 0}
+    thinking_on = args.thinking == "on"
     state = {"handled": 0}
 
     def tick() -> None:  # 调用方已持有 lock
@@ -512,17 +545,23 @@ def main() -> int:
                 counts["截断"] += 1
                 if not args.keep_truncated:
                     return
-            if not reasoning:
+            if thinking_on and not reasoning:
                 counts["没有推理"] += 1
+                return
+            if not thinking_on and reasoning:
+                # 要的是关思考,回来的却带推理:服务端的模板没理会 enable_thinking=False。
+                # 这种样本和关思考的评测对不上,不要。
+                counts["关思考没生效"] += 1
                 return
             if not answer:
                 counts["没有答案"] += 1
                 return
+            assistant = {"role": "assistant", "content": answer}
+            if thinking_on:
+                assistant["reasoning_content"] = reasoning
             fh.write(json.dumps({
-                "messages": [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer, "reasoning_content": reasoning},
-                ],
+                "messages": [{"role": "user", "content": question}, assistant],
+                "thinking": args.thinking,
                 "finish_reason": finish,
                 "completion_tokens": n_completion,
                 "reasoning_tokens": n_reasoning,
@@ -542,6 +581,10 @@ def main() -> int:
     print("  " + "  ".join(f"{k} {v}" for k, v in counts.items()))
     for err in errors:
         print(f"  !! 请求失败的例子: {err}")
+    if counts["关思考没生效"]:
+        print(f"  !! {counts['关思考没生效']} 条在 --thinking off 下仍然带推理:服务端的 chat template 没理会 "
+              "enable_thinking=False。这些已丢弃。")
+        print("     全都是这样的话,检查服务用的模板是不是 Qwen3.6 自己的那份。")
     if counts["截断"]:
         kept = "保留了" if args.keep_truncated else "丢掉了"
         print(f"  截断率 {100 * counts['截断'] / len(prompts):.1f}%({kept})。偏高说明 --max-tokens 对这批提问太小,"
