@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 阶段 2(训练线):装包 + 过六道闸门。工单阶段 6(LoRA 训练)才需要。
+# 阶段 2(训练线):装包 + 过七道闸门。工单阶段 6(LoRA 训练)才需要。
 #
 #     conda activate lqq-train
 #     bash env/2_pip_train.sh
@@ -7,13 +7,14 @@
 # proxy 由你自己开关 —— 本脚本不碰任何 proxy 变量。
 # 本机的情况是:**这一步(pip / git)需要 proxy 关掉。**
 #
-# 六道闸门,每道失败都会打出下一步该查什么:
+# 七道闸门,每道失败都会打出下一步该查什么:
 #     GATE 1  torch           装上且能 import
 #     GATE 2  torch_npu       能 import(ABI 匹配 + CANN 能找到)—— 最容易炸
 #     GATE 3  torchtitan_npu  能 import(torch 版本够新)
 #     GATE 4  LoRA 配置树     分组专家 LoRA 能挂上 Qwen3.5-35B-A3B
 #     GATE 5  训练配置        本仓库的 qwen36_lora_recipe 能 import、能构造(到建模型之前)
 #     GATE 6  并行化          8 个 CPU 进程把整个模型(meta device)真的并行化一遍
+#     GATE 7  Triton 启动代码 GDN kernel 第一次运行时要现编的那段 C++,在这台机器上编得出来
 #
 # 全程不占 NPU:GATE 3/4 置空 ASCEND_RT_VISIBLE_DEVICES,纯 CPU。
 # 真正上卡的 5 步 dry run 是脚本最后单独给出的几条命令(要 8 张卡)。
@@ -477,15 +478,29 @@ else
     RC6=$?
 fi
 
+# ---------------------------------------------------------------- GATE 7
+say "8. Triton 的 kernel 启动代码编得出来吗  (GATE 7)"
+echo "30 层 GatedDeltaNet 的 NPU kernel 是 Triton-Ascend 写的,第一次运行时才现编 C++ 启动代码 ——"
+echo "编不过要等 8 张卡加载完权重、跑到第一次前向才知道。这一步只编译、不执行,不占 NPU,约半分钟。"
+echo "g++: $(g++ --version 2>/dev/null | head -1 || echo '没有 g++')"
+RC7=3
+if [ -z "$(pkg_ver triton-ascend)" ]; then
+    echo "triton-ascend 没装上,GATE 7 没法跑。"
+else
+    cpu_only "$P" "$REPO_ROOT/verify/probe_triton_launcher_cpu.py"
+    RC7=$?
+fi
+
 say "完成"
 echo "解释器: $P"
 echo "仓库:   $TT_DIR"
-if [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ] && [ "$RC6" -eq 0 ]; then
-    echo "六道闸门全过。"
+if [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ] && [ "$RC6" -eq 0 ] && [ "$RC7" -eq 0 ]; then
+    echo "七道闸门全过。"
 else
+    [ "$RC7" -ne 0 ] && echo "GATE 7 未过(rc=$RC7):Triton 的启动代码编不过,GDN kernel 跑不起来。看上面的 error 行;rc=3 是没跑。"
     [ "$RC" -ne 0 ] && echo "GATE 4 未过(rc=$RC):rc=2 是 import/环境问题,rc=1 是判据不成立。看上面的输出。"
     [ "$RC" -eq 0 ] && [ "$RC5" -ne 0 ] && echo "GATE 5 未过(rc=$RC5):rc=2 是 import/环境问题,rc=1 是判据不成立,rc=3 是没跑。"
-    [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ] && echo "GATE 6 未过(rc=$RC6):看上面 rank0 的输出;rc=3 是没跑。"
+    [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ] && [ "$RC6" -ne 0 ] && echo "GATE 6 未过(rc=$RC6):看上面 rank0 的输出;rc=3 是没跑。"
 fi
 if [ -z "$(pkg_ver triton-ascend)" ]; then
     echo "!! triton-ascend 没装上 —— 见 GATE 4 之前的说明。"

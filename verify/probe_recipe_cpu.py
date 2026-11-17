@@ -164,6 +164,12 @@ if last is not None:
 else:
     check("至少有一个配置构造成功", False)
 
+print("\n== Triton 的编译器包装")
+_cc = os.environ.get("CC", "")
+check("导入 recipe 之后 CC 指向 env/triton_cxx.sh,且可执行",
+      _cc.replace("\\", "/").endswith("env/triton_cxx.sh") and os.access(_cc, os.X_OK),
+      f"CC={_cc or '(没设)'}")
+
 print("\n== 权重路径的环境变量")
 _SMOKE = "qwen36_35b_a3b_lora_smoke"
 _PLACEHOLDER = os.environ["HF_ASSETS_PATH"]

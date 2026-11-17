@@ -124,6 +124,7 @@ verify/
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
   probe_recipe_cpu.py      训练配置能否 import / 构造(需训练环境;安装脚本的闸门 5)
   probe_parallelize_cpu.py 8 个 CPU 进程把整个模型真的并行化一遍(安装脚本的闸门 6)
+  probe_triton_launcher_cpu.py  Triton kernel 的 C++ 启动代码在本机编不编得出来(闸门 7)
   probe_weights_map_cpu.py checkpoint 的键和形状与模型是否对得上(要 checkpoint 目录,起训练前跑)
 ```
 
@@ -162,8 +163,8 @@ verify/
 ### LoRA 线的三件代码就位之后,还差什么
 
 1. **训练环境**(`env/2_pip_train.sh`)—— 2026-11-16 在开发机的一个全新环境里
-   **六道闸门全过**(CANN 8.5.1,纯 CPU)。另一台机器上闸门 1–5 已过,第 6 道是
-   2026-11-16 第一次上卡之后加的,待复跑。
+   **七道闸门全过**(CANN 8.5.1、GCC 10.3.1,纯 CPU)。另一台机器上闸门 1–6 已过;
+   第 7 道是 2026-11-17 第一次前向之后加的,待复跑。
 2. **§0.1 闸门**:`verify/probe_lora_tree.py` —— 同上,已过。
 3. **一张空闲卡**跑 `qwen36_35b_a3b_lora_smoke`(20 步)。**这一步还没人跑过。**
 
@@ -192,7 +193,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 九个会改排期的发现
+### 十个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -366,6 +367,43 @@ if "experts.gate_up_proj" in name:
 **这一条为什么之前没拦住**:闸门 4 / 5 只到"单进程、不建设备网格、不碰 checkpoint"为止。
 工单 §0.3 的形状预检核的是 config 推出来的形状,没有走 upstream 的适配器。
 
+**十、第一次前向:GDN kernel 的启动代码在这套环境上编不过。**
+
+2026-11-17,权重加载成功(60.85 秒,三行日志都对)、跑到第一次前向,第 0 层的
+GatedDeltaNet 报:
+
+```
+RuntimeError: Failed to compile .../precompiled.h.gch
+  ATen/ATen.h:5:2: error: #error C++20 or later compatible compiler is required to use ATen.
+  AclInterface.h:308:5: error: 'aclmdlRICondHandle' has not been declared
+```
+
+Triton-Ascend 每个 kernel **第一次运行时**才现编一小段 C++ 启动代码。这套环境上三处对不上:
+
+| 问题 | 依据 | 本仓库的处理 |
+|---|---|---|
+| triton-ascend 3.2.1 写死 `-std=c++17`,torch 2.14 的 `ATen.h` 要求 C++20 | `triton/backends/ascend/utils.py`;torchtitan-npu 自己的测试也把这一条标成已知问题(`xfail`:"Re-enable once Triton-Ascend is updated") | 换成 `-std=c++20` |
+| GCC 10 开了 C++20,`__cplusplus` 仍是 `201709L`(GCC 11 起才是 `202002L`),`ATen.h` 的检查还是不过 | `echo \| g++ -std=c++20 -x c++ -E -dM -` | 显式定义成 `202002L`。头文件本身在 GCC 10 的 C++20 模式下编得过(实测) |
+| torch_npu 的头文件引用了 CANN 9.x 才有的类型,CANN 8.x 的头里没有 | `AclInterface.h` 声明的三个函数用到 `aclmdlRICondHandle` / `aclmdlRICondTaskParams` | `env/triton_cann_compat.h` 补两个声明。启动代码只 include 那个头,不调用这三个函数 |
+
+做法是一个**编译器包装脚本** `env/triton_cxx.sh`:triton-ascend 取编译器时读环境变量 `CC`,
+`src/qwen36_triton_env.py`(recipe 导入时调)把 `CC` 指过去。不改任何第三方包;只对带
+`-std=c++17` 的那几条命令动手,其余原样交给真正的 `g++`。`CC` 已被设成别的东西时不覆盖,
+只告警(要两者都用:`QWEN36_REAL_CXX=<你的编译器> CC=<本仓库>/env/triton_cxx.sh`)。
+
+`verify/probe_triton_launcher_cpu.py`(安装脚本的闸门 7)把 triton-ascend 自己的那两步原样
+调一遍:预编译头、编启动代码的 `.so`,再 import 它。不占 NPU。开发机(GCC 10.3.1、
+CANN 8.5.1)实测:不带包装时报的就是上面那几行;带包装三步全过。预编译头约 500 MB,
+第一次会写进 `~/.triton/cache/`。
+
+**根子上的问题没有解决,只是绕过去了:这台机器的 CANN 比这套软件栈验证过的版本老一个
+大版本。** torchtitan-npu 的 `docs/user-guides/installation.md` 写的是 torch 2.14 配
+CANN 9.2.0,而开发机和另一台机器都是 8.x(安装脚本一开始就在告警)。torch_npu 是按新
+CANN 编的,在老 CANN 上 import 得起来是因为符号是用到才解析的 —— 所以同类问题只会在
+"第一次用到某个东西"时冒出来。**已知还没走到的一处**:10 层全注意力层(第一层在
+layer 3);另一台机器上安装脚本的 CANN 检查里 `aclnnFlashAttentionScoreV3` 的符号数是 0,
+它会不会被用到没有验证过。根治办法是换 CANN 9.x。
+
 **验到哪一步**:闸门 5 现在核对这些开关在配置里是对的,并且把训练启动器的参数解析
 原样走了一遍(`--training.steps 5` 生效、开关没被冲掉)。**真权重是否加载成功、
 加载后键是否全对上,只有上卡的 dry run 日志能回答。**
@@ -500,8 +538,8 @@ MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
 `MODULE=qwen36_lora_recipe` 不是 `torchtitan_npu.models.qwen3_5` —— 那个模块的
 全部名字都被搬进了我们这个模块,所以它是**超集**,而 torchtitan-npu 的
 clone 一个文件都不用改。在一份**干净的** clone 上这句话要靠本仓库的
-`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"九个会改排期的
-发现"第七、八、九条。起训练之前先确认闸门 5、6 过了,并核对权重映射:
+`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"十个会改排期的
+发现"第七至十条。起训练之前先确认闸门 5、6、7 过了,并核对权重映射:
 
 ```bash
 python3 verify/probe_recipe_cpu.py
@@ -509,6 +547,10 @@ python3 verify/probe_recipe_cpu.py
 
 ```bash
 python3 verify/probe_parallelize_cpu.py
+```
+
+```bash
+python3 verify/probe_triton_launcher_cpu.py
 ```
 
 ```bash
@@ -728,6 +770,7 @@ conda activate lqq-train && bash env/2_pip_train.sh
 | 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑"。缺 `fla` / `triton` 会在它之前被拦下 |
 | 5 | 本仓库的训练配置能 import、能构造,**且配置里"加载真权重"是开着的**(`verify/probe_recipe_cpu.py`) | 缺 `torchvision`:训练入口 `torchtitan_npu.models.qwen3_5` 要它,闸门 4 的入口走不到。或 recipe 被改回了不加载权重的写法(见"八个会改排期的发现"第八条) |
 | 6 | 8 个 CPU 进程把整个模型(meta device)并行化一遍(`verify/probe_parallelize_cpu.py`) | 某个模块的参数没有切分声明(第一次上卡报的 `w13_lora_a has no placement declared` 就是这一类)。前面几道都是单进程,走不到这里 |
+| 7 | Triton kernel 的 C++ 启动代码在本机编得出来(`verify/probe_triton_launcher_cpu.py`) | 编译器 / CANN 头文件和 torch、torch_npu 的头文件对不上。不过的话 GDN kernel 跑不起来,而且要等到第一次前向才报。见"十个会改排期的发现"第十条 |
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
 真正上卡的 5 步 dry run 是脚本最后单独给出的几条命令(要 8 张卡),见"LoRA 训练怎么起"。

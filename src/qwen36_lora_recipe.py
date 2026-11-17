@@ -74,6 +74,13 @@ from dataclasses import replace
 
 logger = logging.getLogger(__name__)
 
+# triton-ascend 第一次跑 GDN kernel 时要现编 C++ 启动代码,在 torch 2.14 + CANN 8.x 上
+# 要走本仓库的编译器包装才编得过(见 qwen36_triton_env.py / env/triton_cxx.sh)。
+# 放在导入时:每个 rank 的进程都会导入本模块,而 kernel 到第一次前向才编。
+from qwen36_triton_env import ensure_triton_compiler as _ensure_triton_compiler  # noqa: E402
+
+_TRITON_COMPILER_NOTE = _ensure_triton_compiler()
+
 # 搬入 NPU 侧 qwen3_5 的命名空间。import 本身也触发该包的注册副作用,
 # 所以 MODULE=qwen36_lora_recipe 等价于 MODULE=torchtitan_npu.models.qwen3_5 + 本文件。
 from torchtitan_npu.models import qwen3_5 as _npu_qwen35  # noqa: E402
@@ -340,6 +347,7 @@ def _wire_npu_overrides(config: Trainer.Config) -> Trainer.Config:
 
 
 def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
+    logger.info("Triton 编译器: %s", _TRITON_COMPILER_NOTE)
     config = qwen35_35b_a3b()
     config = _wire_weights(config)
     config = _wire_npu_overrides(config)
