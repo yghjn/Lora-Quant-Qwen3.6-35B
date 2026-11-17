@@ -120,7 +120,7 @@ verify/
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,26 项,纯 CPU,参考值用 einsum 独立算
-  test_gen_trace_cpu.py    轨迹生成自测,28 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
+  test_gen_trace_cpu.py    轨迹生成自测,37 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
   test_adapter_save_cpu.py adapter 落盘自测,21 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
@@ -158,7 +158,7 @@ verify/
 | §4.3 混精评测 | 未做,卡被占 |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**2026-11-17 在另一台机器 8 卡上跑通 5 步 smoke**(原始权重 + 合成语料) |
 | §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),21 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
-| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,28 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
+| §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,37 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,26 项自测全过;读分片时会规范化参数名(旧分片也能用) |
 | §6 LoRA 训练本身 | 5 步 smoke 已跑通;**正式训练未做** —— 还差量化后的基座、真实语料、基线评测 |
 
@@ -615,6 +615,31 @@ python src/prepare_corpus.py --tokenizer <checkpoint目录> --src <工作目录>
 
 然后 `DATA_FILES=<工作目录>/corpus.jsonl` 起训练。
 
+**提问文件已经备好一份**(2026-11-17,开发机,不在本仓库里):
+`/home/ma-user/work/w84414330/qwen36_corpus/prompts_calib_v6_clean.jsonl`,18607 条,7.7 MB,
+sha256 `4a3c9264814b2f81c6f36f285cf13202952d71247e162c168950e6555fa492b0`。
+来源是 DSv4.1 的 `calib_v6.jsonl`(19531 条,按 MATH-500 / LiveCodeBench / MMLU-Pro 三个靶子
+配的,同事做过 13-gram 去污染),取 User 段、去重、留 40–6000 字符的。粗略看:中文 1%、
+像代码题 18%、像数学题 21%、像选择题 15%。已经乱序,`--n 1000` 直接抽就是均匀的。
+
+对开发机上的三份评测数据做了排除,**一条都没剔掉**:
+
+| 评测集 | 题数 | 提问池里整题出现的 |
+|---|---:|---:|
+| MMLU-Pro test | 12032(题面去重后 11625) | 0 |
+| MATH-500 | 500 | 0 |
+| LiveCodeBench `v6`(175 题的增量) | 175 | 0 |
+
+**LiveCodeBench 这一条有前提。** 同事的去污染是对着 167 题的那个子集做的,他的来源清单里
+另有 888 道"其他 LiveCodeBench 题"。评测工具自己的说明(`scripts/download_lcb_release.sh`)
+写着模型卡上的"LiveCodeBench v6"指 **1055 题的 release_v6**,而项目一直打分用的是 175 题的
+增量。**一旦改用 1055 题版评测,这份提问文件必须对着它重新排除**(开发机上没有那份数据,
+这一条现在验不了):
+
+```bash
+python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --exclude <release_v6 目录> --n 0 --dump-prompts prompts_clean_for_release_v6.jsonl
+```
+
 **前提:一个 OpenAI 兼容的 chat 服务,背后是原始 bf16 权重的 Qwen3.6**(`vllm serve` 那种)。
 本仓库的评测工具用的是进程内引擎,没有现成的 HTTP 服务;`vllm serve` 在这套 NPU 环境上
 怎么起**没有验证过**。它和 bf16 基线评测要的是同一份权重、同一批卡,可以排在一起。
@@ -626,9 +651,14 @@ python src/prepare_corpus.py --tokenizer <checkpoint目录> --src <工作目录>
   `{"text": "<|User|>…<|Assistant|>…"}` 格式(ASCII 和全角标记都认,只取 User 段),
   **不需要把文件拷进本仓库**;用不用、拷不拷由人定。也认 `messages` / `prompt` /
   `question` / `instruction`+`input`。
-* **评测题不能进训练语料**,否则复评的分数不能信。`--exclude` 给评测集的题目文件
-  (MMLU-Pro / MATH-500 / LiveCodeBench),撞上的会被剔除。只做了去空白、不分大小写的
-  全文比对,改写过的同一道题拦不住。不给 `--exclude` 时脚本会明说没查。
+* **评测题不能进训练语料**,否则复评的分数不能信。`--exclude` 可以重复给,直接指到评测集的
+  parquet / arrow / json 文件或目录(MMLU-Pro / MATH-500 / LiveCodeBench)。判据是评测题
+  **整题**出现在提问里:提问往往是"题目 + 选项",只做全文相等会漏;只比开头又会把
+  "Which of the following statements is incorrect?" 这种通用题干误判成撞题(在 `calib_v6` 上
+  实测:只比开头 40 字符报 25 条,核对整题后是 0 条)。改写过的同一道题拦不住。
+  不给 `--exclude` 时脚本会明说没查;评测题文件读不出题目时直接停下。
+* **`--dump-prompts FILE`**:只做筛选 / 去重 / 排除 / 抽样,把提问写成 jsonl 就退出,不请求
+  服务。用来先把一份干净的提问文件定下来,再拿它去生成。
 * **`--max-tokens` 要和训练的 seq_len 对齐。** 上游 `ChatDataset` 对超过 seq_len 的样本是
   **静默丢弃**,不截断(实测:256 的 seq_len 下,一条 2400 字符推理的样本直接没了,日志里
   只有一条 debug)。DSv4.1 那批推理 token 的中位是 2527、p75 是 5674,照搬 8192 的上限,
@@ -647,7 +677,7 @@ python src/prepare_corpus.py --tokenizer <checkpoint目录> --src <工作目录>
 * 采样参数默认是评测那边的(0.6 / 0.95 / top_k 20),不是 DSv4.1 的 1.0 / 0.95。
 * 请求 localhost 时不走代理(不改环境变量,只是这一个请求不用代理)。
 
-**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(28 项)。
+**验到哪一步**:`verify/test_gen_trace_cpu.py` 用假服务把各种返回情况走了一遍(37 项)。
 另外把产物用**真的 Qwen3.6 tokenizer 和模板**过了一遍上游的 `ChatDataset`:带推理的样本,
 没被屏蔽的 label 解出来正是"推理 + 答案",提问部分被屏蔽。**没验到的**:对着真的服务生成、
 `vllm serve` 返回的推理在哪个字段(`reasoning_content` / `reasoning` / 留在 content 里

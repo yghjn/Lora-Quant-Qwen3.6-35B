@@ -55,6 +55,11 @@ DeepSeek 的输出,用它训等于教 Qwen 模仿另一个模型。能从那边�
 * 采样参数默认是评测那边用的(temperature 0.6 / top_p 0.95 / top_k 20),不是
   DSv4.1 的 1.0 / 0.95 —— 让语料的分布贴着部署时的分布。
 * `--exclude`:把评测集的题目排除掉。**训练语料里混进评测题,复评的分数就不能信了。**
+  可以直接给评测集的 parquet / arrow / json 文件或目录。判据是评测题**整题**出现在
+  提问里(提问往往是"题目 + 选项",只做全文相等会漏)。
+  注意 LiveCodeBench:DSv4.1 的提问池是对着 167 题的那个子集去污染的,它的来源里
+  另有 888 道别的 LiveCodeBench 题。换用 1055 题的 release_v6 评测时**必须**重新排除。
+* `--dump-prompts FILE`:只做筛选 / 去重 / 排除 / 抽样,把提问写出来就退出,不请求服务。
 * 可以断点续跑(`--resume`),并发用线程池。
 * 请求 localhost 时不走代理(环境里设了 http_proxy 的话,本机请求会被发到代理上去);
   其它地址照环境变量来。
@@ -116,7 +121,8 @@ def question_of(sample) -> str | None:
                 if isinstance(content, str) and content.strip():
                     return content.strip()
         return None
-    for key in ("prompt", "question", "query"):
+    # problem / question_content 是评测集的字段名(MATH-500 / LiveCodeBench),给 --exclude 用
+    for key in ("prompt", "question", "query", "problem", "question_content"):
         if isinstance(sample.get(key), str) and sample[key].strip():
             return sample[key].strip()
     if isinstance(sample.get("instruction"), str) and sample["instruction"].strip():
@@ -128,10 +134,52 @@ def question_of(sample) -> str | None:
     return None
 
 
+_TABLE_COLUMNS = ("question", "problem", "question_content", "prompt", "text")
+
+
+def _read_table(path: str):
+    """读 .parquet / .arrow(评测集常见的落盘格式)。只取题目那几列,需要 pyarrow。"""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        die(f"读 {path} 需要 pyarrow。", "训练环境和评测环境里都有;或者先把题目导成 jsonl 再给。")
+    if path.endswith(".parquet"):
+        names = pq.read_schema(path).names
+        cols = [c for c in _TABLE_COLUMNS if c in names]
+        if not cols:
+            die(f"{path} 里没有认得的题目列。", f"现有的列:{names};认得的:{list(_TABLE_COLUMNS)}")
+        table = pq.read_table(path, columns=cols)
+    else:
+        try:
+            table = pa.ipc.open_stream(path).read_all()
+        except Exception:  # noqa: BLE001 - 不是流格式就按文件格式读
+            table = pa.ipc.open_file(path).read_all()
+        cols = [c for c in _TABLE_COLUMNS if c in table.column_names]
+        if not cols:
+            die(f"{path} 里没有认得的题目列。", f"现有的列:{table.column_names}")
+        table = table.select(cols)
+    yield from table.to_pylist()
+
+
 def read_samples(path: str):
-    """读 .jsonl(每行一个对象)或 .json(一个数组)。坏行跳过并计数。"""
+    """读 .jsonl(每行一个对象)、.json(一个数组)、.parquet / .arrow,或者一个目录
+    (递归读里面这几种文件)。坏行跳过并计数。"""
+    if os.path.isdir(path):
+        found = []
+        for root, _dirs, files in os.walk(path):
+            found += [os.path.join(root, f) for f in files
+                      if f.endswith((".jsonl", ".json", ".parquet", ".arrow"))]
+        if not found:
+            die(f"目录 {path} 里没有 jsonl / json / parquet / arrow 文件")
+        for f in sorted(found):
+            yield from read_samples(f)
+        return
     if not os.path.isfile(path):
         die(f"找不到文件 {path}")
+    if path.endswith((".parquet", ".arrow")):
+        yield from _read_table(path)
+        return
     with open(path, encoding="utf-8", errors="replace") as fh:
         head = fh.read(1)
         fh.seek(0)
@@ -183,6 +231,49 @@ def load_prompts(paths: list[str], min_chars: int, max_chars: int) -> tuple[list
     return out, stats
 
 
+_FINGERPRINT = 40  # 索引用:去空白、小写之后的前 40 个字符
+
+
+def exclude_eval(prompts: list[str], eval_questions: list[str]) -> tuple[list[str], int, int]:
+    """把"包含某道评测题"的提问剔掉。返回 (留下的提问, 剔掉几条, 涉及几道评测题)。
+
+    判据:评测题(去空白、不分大小写)**整题**出现在提问里。提问往往是"题目 + 选项 /
+    格式说明",只做全文相等会漏;只比开头又会把
+    "Which of the following statements is incorrect?" 这种通用题干误判成撞题
+    (2026-11-17 在 calib_v6 上实测:只比开头 40 字符报 25 条,核对整题后是 0 条)。
+    所以先用开头 40 个字符做索引,命中后再核对整题。不足 40 字符的评测题只做全文相等。
+
+    拦不住的:改写过的同一道题、只引用了题目一部分的提问。
+    """
+    index: dict[str, list[str]] = {}
+    short: set[str] = set()
+    for q in eval_questions:
+        nq = norm(q)
+        if len(nq) >= _FINGERPRINT:
+            index.setdefault(nq[:_FINGERPRINT], []).append(nq)
+        elif nq:
+            short.add(nq)
+    kept: list[str] = []
+    hit_eval: set[str] = set()
+    for p in prompts:
+        np_ = norm(p)
+        matched: list[str] = []
+        if np_ in short:
+            matched = [np_]
+        else:
+            for j in range(0, len(np_) - _FINGERPRINT + 1):
+                cands = index.get(np_[j:j + _FINGERPRINT])
+                if cands:
+                    matched = [nq for nq in cands if np_.startswith(nq, j)]
+                    if matched:
+                        break
+        if matched:
+            hit_eval.update(matched)
+        else:
+            kept.append(p)
+    return kept, len(prompts) - len(kept), len(hit_eval)
+
+
 # ---------------------------------------------------------------- 请求
 def _opener(url: str) -> urllib.request.OpenerDirector:
     host = (urllib.parse.urlparse(url).hostname or "").lower()
@@ -226,9 +317,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prompts", action="append", required=True, help="提问文件,可重复给")
-    ap.add_argument("--out", required=True, help="输出 jsonl")
+    ap.add_argument("--out", help="输出 jsonl(生成时必填)")
     ap.add_argument("--url", default="http://localhost:8900/v1/chat/completions")
-    ap.add_argument("--model", required=True, help="服务里的模型名(vllm serve 的 --served-model-name)")
+    ap.add_argument("--model", help="服务里的模型名(vllm serve 的 --served-model-name;生成时必填)")
+    ap.add_argument("--dump-prompts", metavar="FILE",
+                    help="只做到「筛选 + 去重 + 排除评测题 + 抽样」为止,把提问写成 jsonl 就退出,不请求服务。"
+                         "用来先把一份干净的提问文件定下来")
     ap.add_argument("--n", type=int, default=1000, help="抽多少条提问(默认 1000;0 = 全部)")
     ap.add_argument("--seed", type=int, default=0, help="抽样的随机种子")
     ap.add_argument("--max-tokens", type=int, default=3072,
@@ -246,6 +340,8 @@ def main() -> int:
                     help="保留 finish_reason=length 的轨迹(默认丢:它们教的是不收尾)")
     ap.add_argument("--resume", action="store_true", help="--out 已存在时接着跑,已有的提问不重问")
     args = ap.parse_args()
+    if not args.dump_prompts and not (args.out and args.model):
+        ap.error("生成时 --out 和 --model 都要给(只想导出提问文件就用 --dump-prompts)")
 
     prompts, stats = load_prompts(args.prompts, args.min_chars, args.max_chars)
     print("=== 提问 ===")
@@ -254,13 +350,15 @@ def main() -> int:
         die("一条可用的提问都没有。", "支持的格式见本脚本开头的说明。")
 
     if args.exclude:
-        banned, ex_stats = load_prompts(args.exclude, 0, 10**9)
-        banned_keys = {norm(q) for q in banned}
-        before = len(prompts)
-        prompts = [q for q in prompts if norm(q) not in banned_keys]
-        print(f"  排除评测题:评测集 {len(banned_keys)} 道(读入 {ex_stats['读入']},认不出 {ex_stats['认不出']}),"
-              f"撞上并剔除 {before - len(prompts)} 条")
-        print("  (只做了去空白、不分大小写的全文比对;改写过的同一道题拦不住。)")
+        for path in args.exclude:
+            banned, ex_stats = load_prompts([path], 0, 10**9)
+            if not banned:
+                die(f"--exclude {path} 里一道题都没读出来。",
+                    f"读入 {ex_stats['读入']},认不出 {ex_stats['认不出']}。宁可停下,也不要在没排除的情况下继续。")
+            prompts, n_hit, n_eval = exclude_eval(prompts, banned)
+            print(f"  排除评测题 {path}: {len(banned)} 道 -> 剔掉 {n_hit} 条提问(涉及 {n_eval} 道评测题),"
+                  f"还剩 {len(prompts)}")
+        print("  (判据是评测题整题出现在提问里;改写过的同一道题拦不住。)")
     else:
         print("  **没给 --exclude**:没有检查这些提问和评测集有没有重叠。")
 
@@ -269,6 +367,17 @@ def main() -> int:
         prompts = rng.sample(prompts, args.n)  # 全文件均匀抽样,不取前 N 条
     else:
         rng.shuffle(prompts)
+
+    if args.dump_prompts:
+        os.makedirs(os.path.dirname(os.path.abspath(args.dump_prompts)) or ".", exist_ok=True)
+        with open(args.dump_prompts, "w", encoding="utf-8") as fh:
+            for q in prompts:
+                fh.write(json.dumps({"prompt": q}, ensure_ascii=False) + "\n")
+        lens = sorted(len(q) for q in prompts)
+        n = len(lens)
+        print(f"\n写出 {n} 条提问 -> {args.dump_prompts}")
+        print(f"  长度(字符): min {lens[0]} p25 {lens[n // 4]} 中位 {lens[n // 2]} p75 {lens[3 * n // 4]} max {lens[-1]}")
+        return 0
 
     done_keys: set[str] = set()
     if os.path.exists(args.out):

@@ -180,6 +180,64 @@ def main() -> int:
         check("记下了 finish_reason 和 token 数", all(r.get("finish_reason") == "stop"
                                                 and r.get("reasoning_tokens") == 20 for r in got))
 
+        print("\n--- 排除评测题:整题包含,不是全文相等,也不是只比开头 ---")
+        stem = "Which of the following statements about quantization is incorrect, given the setup below?"
+        ev2 = os.path.join(tmp, "evalset2.json")
+        with open(ev2, "w", encoding="utf-8") as fh:
+            json.dump([
+                {"problem": stem + " The model has 256 experts and a hidden size of 2048."},   # MATH-500 的字段名
+                {"question_content": "给定一个整数数组,返回其中两个数之和等于目标值的下标,要求时间复杂度为 O(n),并说明理由。"},  # LCB 的字段名
+                {"question": "短题"},
+            ], fh, ensure_ascii=False)
+        pool2 = os.path.join(tmp, "pool2.jsonl")
+        pool_rows = [
+            # 评测题 + 选项:全文不相等,但整题在里面 -> 应剔除
+            {"prompt": stem + " The model has 256 experts and a hidden size of 2048.\nA. x\nB. y\nAnswer with the letter."},
+            # 只有题干开头相同(通用题干),后面是另一道题 -> 不该剔除
+            {"prompt": stem + " The codebook has 16 entries and the group size is 128."},
+            {"prompt": "请解答:给定一个整数数组,返回其中两个数之和等于目标值的下标,要求时间复杂度为  O(n),并说明理由。用 Python。"},
+            {"prompt": "短题"},                       # 不足 40 字符的评测题:全文相等才剔
+            {"prompt": "这道题里提到了短题两个字,但不是那道评测题,所以应当保留下来才对。" + PAD},
+            {"prompt": "一道完全无关的提问,用来确认正常的提问不会被误伤。" + PAD},
+        ]
+        with open(pool2, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(r, ensure_ascii=False) for r in pool_rows) + "\n")
+        dumped = os.path.join(tmp, "clean_prompts.jsonl")
+        n_req = len(RECEIVED)
+        p = run(GEN, "--prompts", pool2, "--exclude", ev2, "--n", "0", "--min-chars", "0", "--dump-prompts", dumped)
+        kept_q = [r["prompt"] for r in read_jsonl(dumped)] if os.path.exists(dumped) else []
+        check("--dump-prompts:退出码 0,不需要 --out / --model,也不请求服务",
+              p.returncode == 0 and len(RECEIVED) == n_req, p.stdout[-500:] + p.stderr[-400:])
+        check("评测题 + 选项的提问被剔除(整题包含)", not any("Answer with the letter" in q for q in kept_q), str(kept_q)[:300])
+        check("只有通用题干相同的提问保留(不是只比开头)", any("codebook has 16 entries" in q for q in kept_q))
+        check("中文评测题只差空白也剔除;字段名 problem / question_content 都认",
+              not any("两个数之和" in q for q in kept_q))
+        check("不足 40 字符的评测题只在全文相等时剔除", "短题" not in kept_q and any("提到了短题两个字" in q for q in kept_q))
+        check("共留下 3 条,并报告了剔掉几条", len(kept_q) == 3 and "剔掉 3 条提问" in p.stdout, p.stdout[-400:])
+        empty_ev = os.path.join(tmp, "empty_eval.jsonl")
+        with open(empty_ev, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"nonsense": 1}) + "\n")
+        p = run(GEN, "--prompts", pool2, "--exclude", empty_ev, "--dump-prompts", os.path.join(tmp, "x2.jsonl"))
+        check("评测题文件读不出题目时停下(不在没排除的情况下继续)", p.returncode != 0, p.stdout[-300:] + p.stderr[-300:])
+        p = run(GEN, "--prompts", pool2)
+        check("既没给 --dump-prompts 又没给 --out / --model 时报用法错误", p.returncode != 0)
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            print("  [skip] 没有 pyarrow,parquet 评测集那一项不跑")
+        else:
+            evdir = os.path.join(tmp, "evaldir")
+            os.makedirs(evdir)
+            pq.write_table(pa.table({"question": [stem + " The model has 256 experts and a hidden size of 2048."],
+                                     "answer": ["A"]}), os.path.join(evdir, "test-00000-of-00001.parquet"))
+            d2 = os.path.join(tmp, "clean2.jsonl")
+            p = run(GEN, "--prompts", pool2, "--exclude", evdir, "--n", "0", "--min-chars", "0", "--dump-prompts", d2)
+            got2 = [r["prompt"] for r in read_jsonl(d2)] if os.path.exists(d2) else []
+            check("--exclude 直接给评测集目录(里面是 parquet)",
+                  p.returncode == 0 and len(got2) == 5 and not any("Answer with the letter" in q for q in got2),
+                  p.stdout[-400:] + p.stderr[-300:])
+
         print("\n--- 断点续跑 ---")
         p = run(GEN, *common)
         check("--out 已存在且没给 --resume 时拒绝", p.returncode != 0 and "--resume" in (p.stdout + p.stderr))
