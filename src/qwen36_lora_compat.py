@@ -45,7 +45,7 @@
 from dataclasses import dataclass
 from functools import cache
 
-__all__ = ["lora_converter_config", "shim_active", "describe"]
+__all__ = ["lora_converter_config", "ensure_adapter_sharding", "shim_active", "describe", "ADAPTER_PARAMS"]
 
 
 def _dsv4_lora_module():
@@ -101,8 +101,67 @@ def _converter_cls() -> type:
     return Qwen36LoRAConverter
 
 
+ADAPTER_PARAMS = ("w13_lora_a", "w1_lora_b", "w3_lora_b", "w2_lora_a", "w2_lora_b")
+
+
+def ensure_adapter_sharding() -> list[str]:
+    """让 Qwen 的专家切分声明认得 5 个 adapter 参数。返回这次新加的名字(可重复调用)。
+
+    **为什么需要**(2026-11-16,第一次上卡跑到 ``model.parallelize`` 才暴露)::
+
+        ValueError: LoRA_ClampGroupedExperts.w13_lora_a has no placement declared
+        in sharding_config.state_shardings.
+
+    ``Module._distribute_states``(upstream ``protocols/module.py``)要求模块自己的
+    **每一个**参数都在 ``sharding_config.state_shardings`` 里有声明。这份声明是
+    ``set_moe_sharding_config(..., expert_param_layout=...)`` 按一张"参数名 -> TP 上
+    怎么切"的表生成的,而这张表每个模型各有一份:
+
+    * DSv4 的(``torchtitan_npu/models/deepseek_v4/sharding.py``)把 5 个 adapter
+      和 3 个基座权重**列在一起**,所以 DSv4 的 LoRA 能并行化;
+    * Qwen3.5 的(upstream ``torchtitan/models/qwen3_5/sharding.py``)只有
+      ``w1_EFD`` / ``w2_EDF`` / ``w3_EFD``。converter 把模块换成了带 adapter 的,
+      声明表却还是原来那张。
+
+    做法:把 DSv4 表里 Qwen 表没有的 adapter 条目**原样抄过去**(不自己写一份,
+    以 DSv4 那张为准)。抄的是模块全局的那个 dict 对象,``_set_qwen35_layer_sharding``
+    调用时按名字取它,所以对之后所有的 ``update_from_config`` 生效。
+
+    对不带 LoRA 的 Qwen 配置无影响:声明表里多出来的名字没有对应参数,不会被用到
+    (DSv4 不开 LoRA 时用的就是那张带 adapter 名字的表)。
+
+    开了 EP 时(我们的配置是 EP=8),表里的 TP 切法其实不参与:所有专家参数统一按
+    专家维(dim 0)在 EP 轴上切。5 个 adapter 的 dim 0 都是专家数,和基座权重一致。
+    """
+    from torchtitan.models.qwen3_5 import sharding as qwen_sharding
+
+    from torchtitan_npu.models.deepseek_v4 import sharding as dsv4_sharding
+
+    name = "_GROUPED_EXPERTS_PARAM_LAYOUT"
+    qwen_layout = getattr(qwen_sharding, name, None)
+    dsv4_layout = getattr(dsv4_sharding, name, None)
+    if not isinstance(qwen_layout, dict) or not isinstance(dsv4_layout, dict):
+        raise RuntimeError(
+            f"找不到 {name}(qwen3_5: {type(qwen_layout).__name__},"
+            f" deepseek_v4: {type(dsv4_layout).__name__})—— 上游的切分声明换了写法,"
+            "qwen36_lora_compat.ensure_adapter_sharding 要跟着改。"
+        )
+    missing = [p for p in ADAPTER_PARAMS if p not in dsv4_layout]
+    if missing:
+        raise RuntimeError(f"DSv4 的切分声明里没有 adapter 参数 {missing} —— 参数名变了?")
+
+    added = [p for p in ADAPTER_PARAMS if p not in qwen_layout]
+    for p in added:
+        qwen_layout[p] = dsv4_layout[p]
+    return added
+
+
 def lora_converter_config(**kwargs):
-    """`DeepSeekV4LoRAConverter.Config(**kwargs)` 的替身,字段完全一样。"""
+    """`DeepSeekV4LoRAConverter.Config(**kwargs)` 的替身,字段完全一样。
+
+    顺带保证 adapter 的切分声明已经补上 —— 用了这个 converter 就一定需要它。
+    """
+    ensure_adapter_sharding()
     return _converter_cls().Config(**kwargs)
 
 

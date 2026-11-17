@@ -123,6 +123,8 @@ verify/
   test_adapter_save_cpu.py adapter 落盘自测,15 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
   probe_recipe_cpu.py      训练配置能否 import / 构造(需训练环境;安装脚本的闸门 5)
+  probe_parallelize_cpu.py 8 个 CPU 进程把整个模型真的并行化一遍(安装脚本的闸门 6)
+  probe_weights_map_cpu.py checkpoint 的键和形状与模型是否对得上(要 checkpoint 目录,起训练前跑)
 ```
 
 `src/unisvq_core.py` 是内部 UniSVQ 参考实现的 vendoring 副本,相对原版只改了
@@ -160,7 +162,8 @@ verify/
 ### LoRA 线的三件代码就位之后,还差什么
 
 1. **训练环境**(`env/2_pip_train.sh`)—— 2026-11-16 在开发机的一个全新环境里
-   **五道闸门全过**(CANN 8.5.1,纯 CPU)。另一台机器上闸门 1–3 已过,4/5 待复跑。
+   **六道闸门全过**(CANN 8.5.1,纯 CPU)。另一台机器上闸门 1–5 已过,第 6 道是
+   2026-11-16 第一次上卡之后加的,待复跑。
 2. **§0.1 闸门**:`verify/probe_lora_tree.py` —— 同上,已过。
 3. **一张空闲卡**跑 `qwen36_35b_a3b_lora_smoke`(20 步)。**这一步还没人跑过。**
 
@@ -189,7 +192,7 @@ verify/
 各向异性远强于此,而 LDLQ 的优势随各向异性增长 —— 表里 1.04 到 1.14 倍的增益
 **是下界,不能用来论证 LDLQ 不值得**。
 
-### 八个会改排期的发现
+### 九个会改排期的发现
 
 **一、RTN 在 3bit 可当脚手架,在 2bit 必须放弃。**
 
@@ -318,6 +321,50 @@ adapter。它之所以一直没露头,是因为到这一步之前的所有闸门
 `qwen35_27b_4k_sft`(不是这个模型)、没给 `DATA_FILES`(构造配置时就 `KeyError`)、
 `NGPU=1`(35B 的 EP=8,单卡也装不下)、路径用的是没人读的环境变量。本节上面的
 冒烟命令原先也写着 `NGPU=1`。都已改成"LoRA 训练怎么起"里那一条。
+
+**九、第一次上卡:upstream 对"Qwen + LoRA"和"Qwen3.6 的真文件"各有一处不成立。**
+
+2026-11-16 另一台机器上 8 卡 dry run,`Trainer.__init__` 走到并行化报:
+
+```
+ValueError: LoRA_ClampGroupedExperts.w13_lora_a has no placement declared
+in sharding_config.state_shardings.
+```
+
+顺着这一步往后在 CPU 上核(开发机的 16 个 NPU 当时全被占着,没法上卡),查出三处:
+
+| 问题 | 依据 | 后果 | 本仓库的处理 |
+|---|---|---|---|
+| Qwen 的专家切分声明表里没有 adapter | 并行化要每个参数都有声明。DSv4 的表(`deepseek_v4/sharding.py`)把 5 个 adapter 和 3 个基座权重列在一起;upstream `qwen3_5/sharding.py` 的表只有 `w1_EFD` / `w2_EDF` / `w3_EFD` | 上面那个 `ValueError`,在加载权重之前 | `qwen36_lora_compat.ensure_adapter_sharding`:把 DSv4 表里的 adapter 条目原样抄进 Qwen 的表 |
+| **路由专家权重的排布,upstream 假设的是真文件的转置** | upstream 适配器按 `gate_up_proj [E, dim, 2·hidden]` / `down_proj [E, hidden, dim]` 读(和 transformers 里更早一代的 `Qwen3VLMoeTextExperts` 一样)。Qwen3.6-35B-A3B 真文件(读 26 个分片的文件头)是 `(256, 1024, 2048)` / `(256, 2048, 512)`,即 `[out, in]` | 40 层 × 2 = 80 个张量形状对不上,权重加载不了。这正是工单 §0.4 要拦的"上游 flavor 加载不了真权重" | `src/qwen36_state_dict_adapter.py`:在 upstream 适配器外面套一层,只对这两类键各做一次转置 |
+| MoE 负载均衡偏置默认开着 | upstream `MoE.Config.load_balance_coeff = 1e-3`:每层一个 `expert_bias_E`(初值 0),优化器 pre-hook 每步调整,并加到路由打分上 | 训练时的路由一步步偏离部署时的路由(256 步最多漂 0.256);这个偏置不在 checkpoint 里,合并时也不会导出 | recipe 里设成 `None`(`_disable_load_balancing`)。**这是训练语义上的选择,不是 bug 修复**,不同意可以去掉那一行 |
+
+**`gate_up_proj` 里哪一半是 gate —— 定了:前一半。** 依据是 vLLM 的
+`model_executor/models/qwen3_5.py::load_weights`(基线评测就是它加载的这份 checkpoint):
+
+```python
+# qwen3.5 no need to transpose
+# loaded_weight = loaded_weight.transpose(-1, -2)
+if "experts.gate_up_proj" in name:
+    loaded_weight = loaded_weight.chunk(2, dim=-2)     # [0] -> w1, [1] -> w3
+```
+
+所以 `--gate-up-order` 的默认值 `gate_first` 是对的,那个未决问题可以关了。
+本仓库自己的 `fakequant_rtn.py` / `offline_ptq.py` / `merge_lora.py` 一直是按真文件的
+排布写的(并且自动判朝向),不受这一条影响;受影响的只有"训练框架加载权重"这一环。
+
+新增两个探针,都不占 NPU:
+
+* `verify/probe_parallelize_cpu.py`(安装脚本的闸门 6):起 8 个 CPU 进程,照
+  `Trainer.__init__` 的顺序把 35B 的完整配置建在 meta device 上并行化。不带修复时
+  它报的就是上面那一句;带修复时 8 个进程各持有 32/256 个专家,可训张量恰好 200 个。
+* `verify/probe_weights_map_cpu.py`:用真 checkpoint 的索引和分片文件头核对整张权重
+  映射。实测(Qwen3.6-35B-A3B):模型要的 1026 个键全在、形状全一致;1294 个非 adapter
+  状态全部会被加载;checkpoint 里没用到的只有 19 个 `mtp.*`(多 token 预测头,
+  模型没有这个分支)。把适配器换回 upstream 的再跑,报 80 个张量形状不一致。
+
+**这一条为什么之前没拦住**:闸门 4 / 5 只到"单进程、不建设备网格、不碰 checkpoint"为止。
+工单 §0.3 的形状预检核的是 config 推出来的形状,没有走 upstream 的适配器。
 
 **验到哪一步**:闸门 5 现在核对这些开关在配置里是对的,并且把训练启动器的参数解析
 原样走了一遍(`--training.steps 5` 生效、开关没被冲掉)。**真权重是否加载成功、
@@ -453,12 +500,24 @@ MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
 `MODULE=qwen36_lora_recipe` 不是 `torchtitan_npu.models.qwen3_5` —— 那个模块的
 全部名字都被搬进了我们这个模块,所以它是**超集**,而 torchtitan-npu 的
 clone 一个文件都不用改。在一份**干净的** clone 上这句话要靠本仓库的
-`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"八个会改排期的
-发现"第七、第八条。起训练之前先确认闸门 5 过了:
+`qwen36_lora_compat.py` 和 `qwen36_adapter_save.py` 才成立 —— 见"九个会改排期的
+发现"第七、八、九条。起训练之前先确认闸门 5、6 过了,并核对权重映射:
 
 ```bash
 python3 verify/probe_recipe_cpu.py
 ```
+
+```bash
+python3 verify/probe_parallelize_cpu.py
+```
+
+```bash
+python3 verify/probe_weights_map_cpu.py --hf-assets <checkpoint目录>
+```
+
+第三条要真的 checkpoint 目录:它读索引和各分片的**文件头**(不读权重数据,十几秒),
+核对模型要的每个键 checkpoint 里都有、形状一致、没有哪个模型参数被漏掉。
+**换了 checkpoint(比如假量化的输出)就重跑一次。**
 
 训完合并:
 
@@ -668,6 +727,7 @@ conda activate lqq-train && bash env/2_pip_train.sh
 | 3 | torchtitan_npu 能 import | torch 太旧(缺 `DataParallelMeshDims`);或 upstream torchtitan 没 clone 进 `third_party/`(它不是 submodule);或 torchtitan-npu 没钉在 `3f9f99a`(报 `No module named 'attn_gym.…'`) |
 | 4 | 分组专家 LoRA 挂上 Qwen3.5-35B-A3B | 这是 LoRA 线的闸门。单独跑和读结果见上面"§0.1 闸门怎么跑"。缺 `fla` / `triton` 会在它之前被拦下 |
 | 5 | 本仓库的训练配置能 import、能构造,**且配置里"加载真权重"是开着的**(`verify/probe_recipe_cpu.py`) | 缺 `torchvision`:训练入口 `torchtitan_npu.models.qwen3_5` 要它,闸门 4 的入口走不到。或 recipe 被改回了不加载权重的写法(见"八个会改排期的发现"第八条) |
+| 6 | 8 个 CPU 进程把整个模型(meta device)并行化一遍(`verify/probe_parallelize_cpu.py`) | 某个模块的参数没有切分声明(第一次上卡报的 `w13_lora_a has no placement declared` 就是这一类)。前面几道都是单进程,走不到这里 |
 
 全程不占 NPU(闸门 4 置空 `ASCEND_RT_VISIBLE_DEVICES`,纯 CPU 跑配置树)。
 真正上卡的 5 步 dry run 是脚本最后单独给出的几条命令(要 8 张卡),见"LoRA 训练怎么起"。

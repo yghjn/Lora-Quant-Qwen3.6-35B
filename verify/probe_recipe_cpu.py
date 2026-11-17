@@ -23,6 +23,7 @@
    `hf_assets_path` 等于 `HF_ASSETS_PATH`,且 `load_only` 为真(不存全模型)。
    上游这个开关默认是关的,关着的时候训练照样 exit 0,只是基座是随机的;
 6. NPU 的 GDN kernel override 在 `override.imports` 里,并且那个名字真的存在;
+   权重适配器是本仓库的 `Qwen36StateDictAdapter`;MoE 负载均衡偏置已关;
 7. 把训练启动器的参数解析原样走一遍:`--training.steps 5` 生效,
    前面几条在解析之后仍然成立。
 
@@ -140,6 +141,12 @@ for fn, (rank, alpha) in EXPECT.items():
     check("不保存全模型(load_only)", ck.load_only is True, f"load_only={ck.load_only}")
     check("NPU GDN override 在 override.imports 里", R.NPU_GDN_OVERRIDE in list(cfg.override.imports),
           str(list(cfg.override.imports)))
+    check("权重适配器是 Qwen3.6 的(专家权重 [out, in] 排布)",
+          getattr(spec.state_dict_adapter, "__name__", "") == "Qwen36StateDictAdapter",
+          str(getattr(spec.state_dict_adapter, "__name__", spec.state_dict_adapter)))
+    lb = [l.moe.load_balance_coeff for l in layers if getattr(l, "moe", None) is not None]
+    check("MoE 负载均衡偏置已关(训练时的路由 = 部署时的路由)", bool(lb) and all(v is None for v in lb),
+          f"{sum(v is None for v in lb)} / {len(lb)} 层为 None")
 
 print("\n== adapter 落盘钩子的 import 路径")
 if last is not None:

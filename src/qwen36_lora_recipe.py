@@ -32,6 +32,14 @@ Qwen3.6-35B-A3B 目录、``fakequant_rtn.py`` 的输出目录都满足(后者会
     src/qwen36_adapter_save.py   adapter 落盘。原先 import 的 adapter_save.py 是同事
                                  工作区里的未跟踪文件,干净 clone 里根本没有。
 
+第一次上卡(2026-11-16)又补了两处 upstream 对 Qwen + LoRA 不成立的地方::
+
+    qwen36_lora_compat.ensure_adapter_sharding   adapter 参数的分布式切分声明。
+                                 Qwen 的声明表里只有 3 个基座权重,并行化时报
+                                 "w13_lora_a has no placement declared"。
+    src/qwen36_state_dict_adapter.py   路由专家权重的排布。upstream 假设的是
+                                 Qwen3.6 真文件的转置,加载时形状对不上。
+
 本工单最初是照同事的**工作区**核的,不是照已提交的 ``3f9f99a``,这两处就是差出来的。
 
 退路:如果启动器坚持 MODULE 必须是 ``torchtitan_npu.models.qwen3_5``,
@@ -185,7 +193,43 @@ def _lora_model_spec(rank: int, alpha: float):
         moe_comm_backend="standard",
         converters=_lora_converters(rank, alpha),
     )
-    return replace(spec, parallelize_fn=_parallelize_lora)
+    _disable_load_balancing(spec.model)
+
+    # Qwen3.6 真文件里路由专家权重是 [out, in] 排布,upstream 的适配器假设的是它的
+    # 转置,直接加载形状对不上。见 qwen36_state_dict_adapter.py。
+    from qwen36_state_dict_adapter import Qwen36StateDictAdapter
+
+    return replace(
+        spec,
+        parallelize_fn=_parallelize_lora,
+        state_dict_adapter=Qwen36StateDictAdapter,
+    )
+
+
+def _disable_load_balancing(model_config) -> int:
+    """关掉 MoE 的负载均衡偏置。返回改了多少层。
+
+    upstream ``MoE.Config.load_balance_coeff`` 默认 ``1e-3``(``models/common/moe.py``):
+    每层注册一个 ``expert_bias_E`` buffer(初值 0),由优化器的 pre-hook 每步按专家
+    负载调整,并**加到路由打分上**。那是给从头预训练用的。
+
+    我们是冻结基座、只训补偿 adapter:
+
+    * 这个偏置会让训练时的路由一步步偏离部署时的路由(256 步最多漂 0.256),
+      adapter 学到的是"偏置后的路由"下的补偿;
+    * 它不在 HF checkpoint 里,``merge_lora.py`` 也不会导出它 —— 部署时不存在。
+
+    所以设成 ``None``:不注册 buffer,路由打分就是 checkpoint 里 router 的原值。
+    """
+    changed = 0
+    for layer in model_config.layers:
+        moe = getattr(layer, "moe", None)
+        if moe is not None and getattr(moe, "load_balance_coeff", None) is not None:
+            moe.load_balance_coeff = None
+            changed += 1
+    if changed:
+        logger.info("LoRA: 关掉了 %d 层的 MoE 负载均衡偏置(load_balance_coeff=None)", changed)
+    return changed
 
 
 def _wire_adapter_saver(config: Trainer.Config) -> Trainer.Config:
@@ -323,7 +367,8 @@ def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
     )
 
     # **并行度必须改。** 上游 qwen35_35b_a3b 是 tp=2 / ep=8 = 16 rank,
-    # 我们只有 8 张卡。tp=1 / ep=8,dp_shard=-1 推出来是 1。
+    # 我们只有 8 张卡。tp=1 / ep=8,dp_shard=-1 推出来是 8
+    # (verify/probe_parallelize_cpu.py 实测:world=8 dp_shard=8 tp=1 ep=8)。
     # 256 个专家摊 8 卡 = 32 个/卡。
     config.parallelism = replace(
         config.parallelism,

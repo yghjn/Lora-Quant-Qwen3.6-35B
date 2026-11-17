@@ -282,7 +282,7 @@ DSv4.1:  W_deploy = quant_int8( dequant(W_nbit) + (alpha/rank)·B·A )
 | 0.1 | 验证 `LoRAConverter` 能在 Qwen3.5-35B-A3B 的配置树上挂住分组专家 LoRA。**不需要权重、不需要卡**,构造配置树即可。**但需要 Python >= 3.12 且两个仓库都装上**,见下 | 转换后的配置树里 `routed_experts.inner_experts` 的 config 类型是 `GroupedLoRAExperts.Config`;打印的 LoRA 行形如 `dense=0 grouped=40`。**2026-11-16 通过**(见下"0.1 的结果") |
 | 0.2 | 下 Qwen3.6-35B-A3B 权重,逐文件 Sha256 校验 | 校验全对,条数记录在案 |
 | 0.3 | 用真 config 替换 `qwen36/fixtures/qwen36-35b-a3b/config.json` 重跑形状预检 | 退出码 0,"形状预检:全过" |
-| 0.4 | `35B-A3B` flavor 做 5 步训练 dry run,HF 格式初始加载。**用本仓库的 `qwen36_35b_a3b_lora_smoke` 跑(8 卡)**,不用上游的 `qwen35_35b_a3b()`:后者要 cc12m 多模态数据、16 个 rank,而且**没开 checkpoint**(`enable` 默认 `False`,权重根本不加载)。命令见 README"LoRA 训练怎么起" | `exit=0`,loss 有限且非 NaN;日志里有 `Loading HF safetensors from` 和 `Finished loading the checkpoint`,**没有** `No checkpoint was provided, this is a fresh start`;adapter 分片落盘。**注意**:"无随机初始化告警"不够 —— 不加载权重时上游只打一行 info,不告警(2026-11-16 核对,见 README"八个会改排期的发现"第八条) |
+| 0.4 | `35B-A3B` flavor 做 5 步训练 dry run,HF 格式初始加载。**用本仓库的 `qwen36_35b_a3b_lora_smoke` 跑(8 卡)**,不用上游的 `qwen35_35b_a3b()`:后者要 cc12m 多模态数据、16 个 rank,而且**没开 checkpoint**(`enable` 默认 `False`,权重根本不加载)。命令见 README"LoRA 训练怎么起" | `exit=0`,loss 有限且非 NaN;日志里有 `Loading HF safetensors from` 和 `Finished loading the checkpoint`,**没有** `No checkpoint was provided, this is a fresh start`;adapter 分片落盘。**注意**:"无随机初始化告警"不够 —— 不加载权重时上游只打一行 info,不告警(2026-11-16 核对,见 README"九个会改排期的发现"第八条)。**起之前先跑 `verify/probe_weights_map_cpu.py --hf-assets <目录>`**:upstream 的权重适配器对路由专家的排布假设和 Qwen3.6 真文件相反(第九条),本仓库用 `qwen36_state_dict_adapter.py` 纠正,这个探针核对纠正后的整张映射 |
 | 0.5 | bf16 基线评测(8 卡 vLLM) | 三数据集出数,作为**分母**记录 |
 
 **0.1 的环境前提(2026-11-12 补,原文漏了)。**

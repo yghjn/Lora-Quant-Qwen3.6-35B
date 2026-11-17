@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 阶段 2(训练线):装包 + 过五道闸门。工单阶段 6(LoRA 训练)才需要。
+# 阶段 2(训练线):装包 + 过六道闸门。工单阶段 6(LoRA 训练)才需要。
 #
 #     conda activate lqq-train
 #     bash env/2_pip_train.sh
@@ -7,12 +7,13 @@
 # proxy 由你自己开关 —— 本脚本不碰任何 proxy 变量。
 # 本机的情况是:**这一步(pip / git)需要 proxy 关掉。**
 #
-# 五道闸门,每道失败都会打出下一步该查什么:
+# 六道闸门,每道失败都会打出下一步该查什么:
 #     GATE 1  torch           装上且能 import
 #     GATE 2  torch_npu       能 import(ABI 匹配 + CANN 能找到)—— 最容易炸
 #     GATE 3  torchtitan_npu  能 import(torch 版本够新)
 #     GATE 4  LoRA 配置树     分组专家 LoRA 能挂上 Qwen3.5-35B-A3B
 #     GATE 5  训练配置        本仓库的 qwen36_lora_recipe 能 import、能构造(到建模型之前)
+#     GATE 6  并行化          8 个 CPU 进程把整个模型(meta device)真的并行化一遍
 #
 # 全程不占 NPU:GATE 3/4 置空 ASCEND_RT_VISIBLE_DEVICES,纯 CPU。
 # 真正上卡的 5 步 dry run 是脚本最后单独给出的几条命令(要 8 张卡)。
@@ -464,14 +465,27 @@ else
     RC5=$?
 fi
 
+# ---------------------------------------------------------------- GATE 6
+say "7. 模型能并行化吗  (GATE 6)"
+echo "前面几道都是单进程,走不到 Trainer 里的 parallelize_fn(要有设备网格)。"
+echo "这一步起 8 个 CPU 进程(gloo),模型建在 meta device 上,不占 NPU、不加载权重,约半分钟。"
+RC6=3
+if [ "$RC" -ne 0 ] || [ "$RC5" -ne 0 ]; then
+    echo "GATE 4 / 5 没过,跳过 GATE 6。"
+else
+    cpu_only "$P" "$REPO_ROOT/verify/probe_parallelize_cpu.py"
+    RC6=$?
+fi
+
 say "完成"
 echo "解释器: $P"
 echo "仓库:   $TT_DIR"
-if [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ]; then
-    echo "五道闸门全过。"
+if [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ] && [ "$RC6" -eq 0 ]; then
+    echo "六道闸门全过。"
 else
     [ "$RC" -ne 0 ] && echo "GATE 4 未过(rc=$RC):rc=2 是 import/环境问题,rc=1 是判据不成立。看上面的输出。"
-    [ "$RC" -eq 0 ] && echo "GATE 5 未过(rc=$RC5):rc=2 是 import/环境问题,rc=1 是判据不成立,rc=3 是没跑。"
+    [ "$RC" -eq 0 ] && [ "$RC5" -ne 0 ] && echo "GATE 5 未过(rc=$RC5):rc=2 是 import/环境问题,rc=1 是判据不成立,rc=3 是没跑。"
+    [ "$RC" -eq 0 ] && [ "$RC5" -eq 0 ] && echo "GATE 6 未过(rc=$RC6):看上面 rank0 的输出;rc=3 是没跑。"
 fi
 if [ -z "$(pkg_ver triton-ascend)" ]; then
     echo "!! triton-ascend 没装上 —— 见 GATE 4 之前的说明。"
@@ -486,6 +500,9 @@ cat <<NOTE
 
     export PYTHONPATH=$REPO_ROOT/src:\$PYTHONPATH
     $P $REPO_ROOT/src/prepare_corpus.py --tokenizer \$CKPT --synthetic 64 --out \$WORK/smoke.jsonl
+
+    # 加载 70 GB 之前先核对 checkpoint 的键和形状与模型对得上(只读文件头,十几秒):
+    $P $REPO_ROOT/verify/probe_weights_map_cpu.py --hf-assets \$CKPT
 
     cd $TT_DIR
     export ASCEND_SET_ENV_PATH=$SET_ENV
