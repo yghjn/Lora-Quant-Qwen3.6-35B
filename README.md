@@ -693,7 +693,19 @@ CANN 是主机装的,pip 的版本要跟着它,不能反过来。基线评测要
 curl --noproxy '*' http://127.0.0.1:8901/v1/models
 ```
 
-**这条命令没有在 Qwen3.6 上跑过。** 每个参数的出处:
+**环境里有 vllm 这个包、却没有 `vllm` 命令**(比如装的时候没把入口脚本放进 PATH):把开头的
+`vllm serve` 换成 `python -m vllm.entrypoints.cli.main serve`,其余参数不变。`vllm` 命令本来
+就只是这个模块的入口(`vllm = vllm.entrypoints.cli.main:main`)。先确认昇腾那一半也在:
+
+```bash
+python -c "import vllm, vllm_ascend, torch, torch_npu; print(vllm.__version__, torch.__version__, torch_npu.__version__)"
+```
+
+预期是 `0.18.0 2.9.0+cpu 2.9.0`。`vllm_ascend` 导不进来的话,这个环境只有一半,不能用。
+
+**这条命令没有在 Qwen3.6 上跑过。** 参数名在一个同版本的环境里(vllm 0.18.0 + vllm-ascend
+0.18.0,`serve --help=all`)逐个核对过都存在;`gen_trace.py --thinking off` 用的请求字段
+`chat_template_kwargs` 这个版本也支持。每个参数的出处:
 
 | 参数 | 出处 |
 |---|---|
