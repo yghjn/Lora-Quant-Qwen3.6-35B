@@ -657,6 +657,36 @@ cd <eval_qwen3.6-35b_vllm 目录> && HIF4_MODE=off source scripts/env.sh
 vllm serve <原始 checkpoint 目录> --host 127.0.0.1 --port 8901 --served-model-name qwen36 --dtype bfloat16 --trust-remote-code --tensor-parallel-size 8 --enable-expert-parallel --max-model-len 8192 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --enforce-eager --reasoning-parser qwen3
 ```
 
+**"装了 vLLM 的那个环境"是一个单独的环境,不是 `pip install vllm` 一下就有的,更不能装进
+`lqq-train`。** 昇腾上要的是一整套互相配套的包,而且 torch 版本和训练环境不同:
+
+| | vLLM 环境 | 训练环境 `lqq-train` |
+|---|---|---|
+| Python | 3.11 | 3.12 |
+| torch / torch_npu | 2.9.0 | 2.14 nightly |
+| 其它 | `vllm` 0.18.0 + `vllm-ascend` 0.18.0 + `triton-ascend` 3.2.0,`numpy<2` | torchtitan-npu,`numpy>=2` |
+
+两边的 torch、numpy 互不兼容,装到一起两个都坏。`vllm` 和 `vllm-ascend` 自己声明的依赖还
+互相冲突(一个要 torch 2.10,一个要 2.9),直接 `pip install` 会解不出来。评测工具带了一个
+处理这件事的安装脚本,**用它装**(说明在评测工具 README 的"Bring-up → 1. Install"):
+
+```bash
+conda create -n lqq-vllm python=3.11 -y && conda activate lqq-vllm
+```
+
+```bash
+cd <eval_qwen3.6-35b_vllm 目录> && bash scripts/install_npu_stack.sh
+```
+
+先看一眼机器上是不是已经有了(评测如果在这台机器上跑过,多半有):
+
+```bash
+for e in ~/anaconda3/envs/*; do "$e/bin/python" -c "import vllm, vllm_ascend; print('$e', vllm.__version__)" 2>/dev/null; done
+```
+
+这套版本对应的是主机上的 **CANN 8.5.1**(`cat /usr/local/Ascend/ascend-toolkit/latest/*/ascend_toolkit_install.info`)。
+CANN 是主机装的,pip 的版本要跟着它,不能反过来。基线评测要的也是这个环境,所以迟早要有。
+
 起来之后日志里会有 `Application startup complete`。再开一个终端确认:
 
 ```bash
