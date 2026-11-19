@@ -715,6 +715,26 @@ python -c "import vllm, vllm_ascend, torch, torch_npu; print(vllm.__version__, t
 | `--max-model-len 8192` | 提问(最长 6000 字符)+ 3072 的生成上限,留了余量。评测默认的 65536 用不着,KV cache 白占 |
 | `scripts/env.sh` | 它设的几个变量是这套环境上跑 vLLM 的前提:`VLLM_WORKER_MULTIPROC_METHOD=spawn`(否则 worker 起来就崩,看着像卡住)、`TORCH_DEVICE_BACKEND_AUTOLOAD=0`、CANN 的环境、HCCL 的缓冲区 |
 
+**每次起服务之前,都要在同一个终端里先 `HIF4_MODE=off source scripts/env.sh`。** 不是可选的。
+2026-11-19 在一个没 source 过的终端里直接起,加载完权重、做第一次试跑时 8 个 worker 一起报:
+
+```
+RuntimeError: call aclnnMoeGatingTopK failed, detail:EZ9999: Inner Error!
+  renorm is: 1, but currently only support 0.[FUNC:CheckAttr][FILE:moe_gating_top_k_tiling.cpp]
+```
+
+Qwen3.6 的路由要对 top-k 概率重归一化,vllm-ascend 于是用 `renorm=1` 去调 CANN 的融合算子,
+而 CANN 8.3 和 8.5.1 都不认这个取值(升级 CANN 没用)。评测工具的 `hif4` 插件里有一个专门的
+兼容补丁(`hif4_vllm/ascend_compat.py`):这种情况改走纯 torch 的等价路径。它对所有模式都生效,
+包括 `HIF4_MODE=off` —— 所以"关掉 HiFloat4"不等于"不需要这个插件"。插件靠 `env.sh` 设的环境
+才能在每个 worker 里加载。**起来之后在日志里找这一行,有它才算对**:
+
+```
+[ascend-compat] MoE top-k: forcing the native path when renormalize=True
+```
+
+日志建议留一份(`… 2>&1 | tee vllm.log`):服务中途出问题时,原因只在这里。
+
 三处**不要照抄同事那条命令**:
 
 * **不要加 `--limit-mm-per-prompt '{"image":0,"video":0}'`。** 对 Qwen3.5/3.6 这会让前向直接崩
