@@ -239,8 +239,34 @@ def _disable_load_balancing(model_config) -> int:
     return changed
 
 
-def _wire_adapter_saver(config: Trainer.Config) -> Trainer.Config:
+def _effective_steps(default: int) -> int:
+    """这次训练实际要跑多少步:命令行的 ``--training.steps`` 优先,否则是配置里的值。
+
+    配置函数返回之后,启动器才把命令行参数套上去,而且套出来的是一份新的配置对象 ——
+    所以钩子里手上那份 ``config.training.steps`` 可能是旧的。直接看命令行最可靠。
+    """
+    import sys
+
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        value = None
+        if arg in ("--training.steps", "--training.steps_"):
+            value = argv[i + 1] if i + 1 < len(argv) else None
+        elif arg.startswith("--training.steps="):
+            value = arg.split("=", 1)[1]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                break
+    return int(default)
+
+
+def _wire_adapter_saver(config: Trainer.Config, steps: int) -> Trainer.Config:
     """注册 adapter 落盘钩子(工单 §6.5)。
+
+    ``steps`` 是配置里的总步数,连同命令行覆盖一起交给 saver,让它**最后一步一定保存**。
+    否则 256 步配默认的每 100 步,最后一次保存停在第 200 步,后 56 步白训。
 
     必须挂在 ``post_optimizer_build_fn`` 上:它在 init_states 之后,而
     ``register_adapter_saver`` 要拿到已经建好的 optimizers。链式包装 ——
@@ -263,7 +289,9 @@ def _wire_adapter_saver(config: Trainer.Config) -> Trainer.Config:
         # 的未跟踪文件,干净 clone 里没有 —— 会在加载完权重、建好优化器之后才炸。
         from qwen36_adapter_save import register_adapter_saver
 
-        if not register_adapter_saver(optimizers, model_parts):
+        if not register_adapter_saver(
+            optimizers, model_parts, total_steps=lambda: _effective_steps(steps)
+        ):
             raise RuntimeError(
                 "ADAPTER_SAVE_DIR 未设置 —— adapter 不会被保存,等于白训。"
                 "设它指向一个输出目录后重跑。"
@@ -356,7 +384,7 @@ def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
     # target_modules=() 只动路由专家,碰不到 embedding / lm_head,词表不变,
     # 所以沿用上游算好的那个值是对的。
     config.model_spec = _lora_model_spec(rank, alpha)
-    config = _wire_adapter_saver(config)
+    config = _wire_adapter_saver(config, steps)
 
     # 语料:prepare_corpus.py 产出的 jsonl,每行一个 {"messages": [...]}。
     config.dataloader = ChatDataLoader.Config(

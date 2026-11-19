@@ -6,6 +6,325 @@ Qwen3.6-35B-A3B 路由专家的低位宽权重量化(2bit / 3bit)+ LoRA 误差�
 主文档是 [`docs/Qwen3.6-35B-低位宽量化+LoRA-开发工单.md`](docs/Qwen3.6-35B-低位宽量化%2BLoRA-开发工单.md):
 做什么、改哪一行、怎么算做完,每条都有验收判据。
 
+**想照着做,直接看下面的"完整流程:从头到尾"。** 那是主线:十步,每步写了在哪个环境、
+要不要卡、命令、做完的标志。它后面的各节是细节和排查记录,按需查。
+
+## 完整流程:从头到尾
+
+**这一节是主线,照着做就行。** 后面各节是每一步的细节、原理和排查记录,出问题或想知道
+为什么时再查(对应关系见本节末尾的"细节在哪一节")。
+
+目标:把 Qwen3.6-35B-A3B 的路由专家量化到 3bit(以及 2bit),再训一个 LoRA adapter 把量化
+损失的精度补回来,最后合并成一份可直接部署的 checkpoint,用三个评测集验证。
+
+### 先认清三个环境和几个变量
+
+三个 Python 环境**互不兼容,不能混装**(torch 和 numpy 的版本要求相反):
+
+| 环境 | Python | 用来做什么 | 怎么来 |
+|---|---|---|---|
+| `lqq-quant` | 3.10 | 量化、合并(只要 torch + safetensors) | `env/1_conda_envs.sh` + `env/2_pip_quant.sh` |
+| `lqq-train` | 3.12 | LoRA 训练、所有 `verify/` 下的检查 | `env/2_pip_train.sh` |
+| vLLM 环境 | 3.11 | 起模型服务、跑评测 | 评测工具的 `scripts/install_npu_stack.sh`;运行机上是 `PyTorch-2.7.1` 那个环境 |
+
+量化和合并在 `lqq-train` 里跑也行。
+
+下面的命令都用这几个变量。**每开一个新终端都要重新设一遍**:
+
+```bash
+export REPO=<本仓库的路径>
+```
+
+```bash
+export CKPT=/home/ma-user/work/public/LLM/checkpoints/Qwen/Qwen3.6-35B-A3B
+```
+
+```bash
+export WORK=<工作目录,至少留 200 GB>
+```
+
+```bash
+export Q3=$WORK/qwen36-3bit-rtn
+```
+
+```bash
+export EVAL=/home/ma-user/work/w84414330/eval_qwen3.6-35b_vllm
+```
+
+`CKPT` 是原始权重(只读),`Q3` 是第 2 步要生成的 3bit 基座,`EVAL` 是评测工具的目录。
+
+### 十步总览
+
+| 步 | 做什么 | 环境 | 占卡 | 大约多久 | 做完的标志 |
+|---:|---|---|---|---|---|
+| 1 | 装训练环境、过闸门 | `lqq-train` | 否 | 首次约半小时 | 结尾打印"七道闸门全过" |
+| 2 | 生成 3bit 量化基座 | `lqq-quant` | 否 | 约 7 分钟 | `$Q3` 生成,权重核对"通过" |
+| 3 | 准备提问文件 | 任意 | 否 | 已备好 | 手上有 `prompts_calib_v6_clean.jsonl` |
+| 4 | 用**原始权重**起模型服务 | vLLM | 8 卡 | 加载几分钟 | 日志有 `ascend-compat` 那一行,`curl` 有返回 |
+| 5 | 生成语料并整理 | 任意 | 服务占着 | 约 70 token/秒;2300 条约 8 小时 | `corpus.jsonl`,token 合计 200 万以上 |
+| 6 | 停服务,跑两组基线评测 | vLLM | 8 卡 | 看评测集大小 | 原始权重、3bit 各一组分数 |
+| 7 | 在 3bit 基座上冒烟训练 | `lqq-train` | 8 卡 | 几分钟 | 三行日志 + 8 个分片 + 合并试读通过 |
+| 8 | 正式训练 | `lqq-train` | 8 卡 | 没实测过 | 最后一步的 8 个 adapter 分片 |
+| 9 | 把 adapter 合并进基座 | `lqq-quant` | 否 | 没实测过(读写约 70 GB) | 生成 `merge_info.json` |
+| 10 | 复评并对比 | vLLM | 8 卡 | 同第 6 步 | 三组分数的对比 |
+
+第 4、6、7、8、10 步都要 8 张卡,**只能一步一步排着来**。
+
+**现在做到哪了(2026-11-19)**:第 1、2、3 步完成;第 4 步服务已起;第 5 步进行中(已有 225 条、
+约 20 万 token,不够);第 7 步只在**原始权重**上跑通过 5 步冒烟和合并试读,3bit 基座上还没跑;
+第 6、8、9、10 步没做。
+
+### 第 1 步:装训练环境、过闸门
+
+```bash
+conda activate lqq-train
+```
+
+```bash
+cd $REPO && git pull && bash env/2_pip_train.sh
+```
+
+已装的包会跳过。七道闸门全部在 CPU 上跑,不占卡,它们拦的是"要等 8 张卡加载完权重才暴露"的
+那类问题。**任何一道没过都不要往下走。** 第一次装环境、或装不上,看"训练环境安装"。
+
+### 第 2 步:生成 3bit 量化基座
+
+```bash
+conda activate lqq-quant
+```
+
+```bash
+cd $REPO && python -I src/fakequant_rtn.py --in $CKPT --scan
+```
+
+```bash
+python -I src/fakequant_rtn.py --in $CKPT --out $Q3 --bits 3 --group 128
+```
+
+第一条只读文件头,确认哪些张量会被量化;第二条写出一份完整的约 70 GB 的新 checkpoint
+(量化后再还原成 bf16,所以普通的训练和推理都能直接加载)。然后在 `lqq-train` 里核对它和模型
+对得上:
+
+```bash
+conda activate lqq-train && python verify/probe_weights_map_cpu.py --hf-assets $Q3
+```
+
+要看到"结论:通过"。**每换一份 checkpoint 都重跑这一条**,十几秒,不读权重数据。
+
+### 第 3 步:准备提问文件
+
+已经备好一份:开发机上的
+`/home/ma-user/work/w84414330/qwen36_corpus/prompts_calib_v6_clean.jsonl`(18607 条,不在本仓库里),
+拷到运行机上即可。它和 MMLU-Pro、MATH-500、LiveCodeBench 175 题版零重叠。
+以后评测集变了要重新排除,见"正式训练的语料"。
+
+### 第 4 步:用原始权重起模型服务
+
+`gen_trace.py` 只是客户端,要先有服务。**服务加载的是 `$CKPT`(原始权重),不是 `$Q3`** ——
+语料必须来自没量化的模型,adapter 学的就是让量化后的模型复现它。
+
+先确认没有上一次留下的服务还占着端口(应当没有输出):
+
+```bash
+ss -ltnp | grep 8901
+```
+
+有输出就先把那些进程杀掉。vLLM 允许多个进程共用一个端口,旧进程不清掉的话,新服务照样
+能起来,但一部分请求会被分给旧进程、永远没有回应。
+
+然后在**同一个终端**里依次执行(第一条不是可选的,少了它服务起不来):
+
+```bash
+cd $EVAL && HIF4_MODE=off source scripts/env.sh
+```
+
+```bash
+python -m vllm.entrypoints.cli.main serve $CKPT --host 127.0.0.1 --port 8901 --served-model-name qwen36 --dtype bfloat16 --trust-remote-code --tensor-parallel-size 8 --enable-expert-parallel --max-model-len 8192 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --enforce-eager --reasoning-parser qwen3 2>&1 | tee $WORK/vllm.log
+```
+
+这个终端会一直被服务占着。看到 `Application startup complete` 后另开一个终端检查两件事:
+
+```bash
+grep "ascend-compat" $WORK/vllm.log
+```
+
+```bash
+curl --noproxy '*' http://127.0.0.1:8901/v1/models
+```
+
+第一条要能搜到 `MoE top-k: forcing the native path`,第二条要立刻返回模型列表。
+
+### 第 5 步:生成语料并整理
+
+先试 50 条,看一眼结尾的统计:
+
+```bash
+cd $REPO && python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --out $WORK/traces.jsonl --url http://127.0.0.1:8901/v1/chat/completions --model qwen36 --thinking off --n 50 --max-tokens 3072
+```
+
+"关思考没生效"应为 0,"请求失败"应为 0 或很少。没问题就加大 `--n` 接着跑(同一个文件,
+加 `--resume`,已有的不会重问):
+
+```bash
+python src/gen_trace.py --prompts prompts_calib_v6_clean.jsonl --out $WORK/traces.jsonl --url http://127.0.0.1:8901/v1/chat/completions --model qwen36 --thinking off --n 3000 --max-tokens 3072 --resume
+```
+
+`--thinking off` 是因为三个评测都是关思考跑的,语料要和评测一致。服务中途出问题时脚本会
+自己停下并说明情况;重启服务后同一条命令再跑一次即可。
+
+生成完后整理成训练用的语料(在 `lqq-train` 里,要用到 tokenizer):
+
+```bash
+conda activate lqq-train && python src/prepare_corpus.py --tokenizer $CKPT --src $WORK/traces.jsonl --seq-len 4096 --out $WORK/corpus.jsonl
+```
+
+看结尾的"token 合计":**目标 200 万以上**(DSv4.1 最大一版是 280 万,当时仍嫌不够)。
+不够就回去加大 `--n` 续跑,再整理一次。
+
+### 第 6 步:停服务,跑两组基线评测
+
+在服务的终端按 `Ctrl+C`,然后确认卡空出来了:
+
+```bash
+npu-smi info
+```
+
+基线评测用评测工具跑,要两组:原始权重、3bit 不带 LoRA。没有它们,训完之后无从判断 LoRA
+补回了多少。**两次必须用不同的 `TAG`**,否则第二次会接着第一次的结果算。
+
+```bash
+cd $EVAL && source scripts/env.sh
+```
+
+```bash
+TAG=bf16 scripts/run_arm.sh baseline all
+```
+
+```bash
+MODEL_PATH=$Q3 TAG=q3 scripts/run_arm.sh baseline all
+```
+
+这两条引自评测工具自己的说明,**本仓库这一轮没有重新跑过**;细节以评测工具的 README 为准。
+
+### 第 7 步:在 3bit 基座上冒烟训练
+
+只跑 5 步,目的是确认"量化后的基座 + 真语料"这条路是通的,再投入正式训练的时间。
+
+```bash
+conda activate lqq-train && export PYTHONPATH=$REPO/src:$PYTHONPATH && export ASCEND_SET_ENV_PATH=/usr/local/Ascend/ascend-toolkit/set_env.sh
+```
+
+```bash
+cd ~/src/torchtitan-npu && NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_smoke HF_ASSETS_PATH=$Q3 DATA_FILES=$WORK/corpus.jsonl ADAPTER_SAVE_DIR=$WORK/adapter_smoke bash scripts/run_train.sh --training.steps 5 2>&1 | tee $WORK/train_smoke.log
+```
+
+四样东西都对才算过:
+
+| 看什么 | 应该是 |
+|---|---|
+| 日志 `Loading HF safetensors from --model.hf_assets_path` 和 `Finished loading the checkpoint` | 都有。出现 `No checkpoint was provided, this is a fresh start` 就立刻停:基座是随机的 |
+| 日志 `LoRA: 冻结了 1294 个非 adapter 参数,可训 adapter 张量 200 个` | 数字一致 |
+| 每步的 loss | 明显低于 12(接近 12 说明有权重没加载进去) |
+| `$WORK/adapter_smoke/` | 8 个 `adapter_r0X_step000005.safetensors` |
+
+再让合并工具试读一遍这批分片(不写文件):
+
+```bash
+cd $REPO && python src/merge_lora.py --base $Q3 --adapter $WORK/adapter_smoke --rank 16 --alpha 32 --dry-run
+```
+
+### 第 8 步:正式训练
+
+按语料量选配置:
+
+| 配置 | rank / alpha | 什么时候用 |
+|---|---|---|
+| `qwen36_35b_a3b_lora_r16` | 16 / 32 | 语料充足(token 合计 200 万以上) |
+| `qwen36_35b_a3b_lora_r4` | 4 / 8 | 语料偏少。参数量是 r16 的四分之一,不容易学成"背语料" |
+
+两个都是 256 步。命令(以 r16 为例;环境变量同第 7 步):
+
+```bash
+cd ~/src/torchtitan-npu && NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_r16 HF_ASSETS_PATH=$Q3 DATA_FILES=$WORK/corpus.jsonl ADAPTER_SAVE_DIR=$WORK/adapter_r16 ADAPTER_SAVE_EVERY=64 bash scripts/run_train.sh 2>&1 | tee $WORK/train_r16.log
+```
+
+每 64 步存一次 adapter,**最后一步一定会存**。做完的标志是 `$WORK/adapter_r16/` 下有
+8 个 `adapter_r0X_step000256.safetensors`。开头几分钟先照第 7 步那张表核对一遍日志。
+**这一步还没有人跑过**,耗时和显存都没有实测数字。
+
+### 第 9 步:把 adapter 合并进基座
+
+`--rank` 和 `--alpha` 必须和训练用的配置一致(r16 是 16 / 32,r4 是 4 / 8)。`--alpha` 故意没有
+默认值:DSv4.1 就是在这里传错,把补偿量放大了 8 倍,一批结果全部作废。
+
+```bash
+cd $REPO && python src/merge_lora.py --base $Q3 --adapter $WORK/adapter_r16 --rank 16 --alpha 32 --dry-run
+```
+
+```bash
+python src/merge_lora.py --base $Q3 --adapter $WORK/adapter_r16 --rank 16 --alpha 32 --out $WORK/qwen36-3bit-lora
+```
+
+```bash
+python verify/probe_weights_map_cpu.py --hf-assets $WORK/qwen36-3bit-lora
+```
+
+第一条试读,第二条写出一份新的约 70 GB 的 checkpoint,第三条核对它能被正常加载。
+合并后的目录是一份普通的 bf16 checkpoint,部署时不需要任何 LoRA 相关的东西。
+
+### 第 10 步:复评并对比
+
+```bash
+cd $EVAL && source scripts/env.sh
+```
+
+```bash
+MODEL_PATH=$WORK/qwen36-3bit-lora TAG=q3_lora scripts/run_arm.sh baseline all
+```
+
+```bash
+python scripts/compare.py --baseline runs/mmlu_pro_baseline_bf16 --quant runs/mmlu_pro_baseline_q3_lora
+```
+
+要的结果是:`q3_lora` 的分数比 `q3` 更接近 `bf16`。对比工具会提示两组用的模型不同,这是
+预期的。同第 6 步,这几条引自评测工具的说明,本仓库没有重跑过。
+
+### 2bit 怎么做
+
+流程完全一样,只换第 2 步:2bit 不能用上面那个量化工具(直接取整在 2bit 下不可用),
+要用 `offline_ptq.py`,先出一版不需要校准数据的:
+
+```bash
+python src/offline_ptq.py run --in $CKPT --out $WORK/qwen36-2bit --bits 2 --hessian identity
+```
+
+之后第 4 到 10 步里的 `$Q3` 换成这个目录(语料可以复用,不用重新生成)。
+**这条命令在真权重上还没跑过。** 细节见"离线 PTQ 怎么跑"和"混合精度怎么挑"。
+
+### 哪些步骤是实际跑通过的
+
+| 步 | 状态 |
+|---|---|
+| 1、2、3 | 在运行机上跑通 |
+| 4 | 服务能起;第一次跑了 38 分钟后有两个 worker 崩溃,原因没查清(当时没留日志) |
+| 5 | 脚本跑通,产出过 225 条;大批量还没跑完过 |
+| 7 | 在**原始权重**上跑通(5 步,含合并试读);3bit 基座上没跑过 |
+| 6、8、9(写出)、10 | **没跑过** |
+| 2bit | 工具有自测,真权重上没跑过 |
+
+### 细节在哪一节
+
+| 想知道 | 看 |
+|---|---|
+| 量化工具的原理、为什么只量化路由专家 | "快速开始"、"量化范围:只做路由专家" |
+| 训练环境怎么装、七道闸门各拦什么、装不上怎么办 | "训练环境安装"、"已知的环境陷阱" |
+| 起服务的每个参数为什么这么写、vLLM 环境怎么装 | "正式训练的语料 → 先起模型服务" |
+| 语料为什么要模型自己生成、思考开关、评测题排除 | "正式训练的语料" |
+| 训练命令里的环境变量、启动后看哪几行日志 | "LoRA 训练怎么起" |
+| 一路上踩过的坑和原因 | "十个会改排期的发现" |
+| 2bit、混合精度 | "离线 PTQ 怎么跑"、"混合精度怎么挑" |
+| 每个文件是干什么的 | "目录" |
+
 ## 快速开始
 
 安装分两个阶段,**因为 conda 和 pip 对 proxy 的要求相反**:
@@ -122,7 +441,7 @@ verify/
   test_merge_lora_cpu.py   合并自测,26 项,纯 CPU,参考值用 einsum 独立算
   test_gen_trace_cpu.py    轨迹生成自测,57 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
-  test_adapter_save_cpu.py adapter 落盘自测,21 项,只需 torch + safetensors
+  test_adapter_save_cpu.py adapter 落盘自测,26 项,只需 torch + safetensors
   probe_lora_tree.py       工单 §0.1:LoRA 能否挂上 Qwen 的配置树(需训练环境,流程见"§0.1 闸门怎么跑")
   probe_recipe_cpu.py      训练配置能否 import / 构造(需训练环境;安装脚本的闸门 5)
   probe_parallelize_cpu.py 8 个 CPU 进程把整个模型真的并行化一遍(安装脚本的闸门 6)
@@ -157,7 +476,7 @@ verify/
 | §4.2 `--keep-hot` 跳过热专家 | **代码完成**,保留专家逐位直通已验 |
 | §4.3 混精评测 | 未做,卡被占 |
 | §6.1–6.5 LoRA trainer 配置 | **代码完成**(`qwen36_lora_recipe.py`);三个配置在 CPU 上能构造(闸门 5);**2026-11-17 在另一台机器 8 卡上跑通 5 步 smoke**(原始权重 + 合成语料) |
-| §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),21 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
+| §6.5 adapter 落盘 | **改为本仓库自带**(`qwen36_adapter_save.py`),26 项自测全过;smoke 里 8 个 rank 各落一片、能拼成 200 个全局张量。第一批分片的键带 `_checkpoint_wrapped_module`,已改成落规范名字 |
 | §6.6 语料 + chat template | 工具**完成**:`prepare_corpus.py`(验模板、数 token)+ `gen_trace.py`(自生成轨迹,57 项自测全过)。**正式语料还没生成** —— 要一个 bf16 的 Qwen3.6 服务 |
 | §7.1/§7.2 `merge_lora.py` | **完成**,26 项自测全过;读分片时会规范化参数名(旧分片也能用) |
 | §6 LoRA 训练本身 | 5 步 smoke 已跑通;**正式训练未做** —— 还差量化后的基座、真实语料、基线评测 |
@@ -412,28 +731,8 @@ layer 3);另一台机器上安装脚本的 CANN 检查里 `aclnnFlashAttentionSc
 
 ## 下一步
 
-与卡的可用性解耦,按这个顺序:
-
-1. ~~下权重、核对键名分类、3bit 假量化~~ —— **已完成**,7.1 分钟,
-   SNR min 10.70 / p50 11.12 / max 11.68 dB。
-2. **不需要卡**:建训练环境(`env/2_pip_train.sh`,proxy 要关),
-   跑 `verify/probe_lora_tree.py`(§0.1)。**这是整条 LoRA 线的闸门。**
-   完整流程和 torchtitan 的来历见"§0.1 闸门怎么跑" —— upstream torchtitan
-   要单独 clone 进 `third_party/`,它不是 submodule。
-3. **不需要卡**:`prepare_corpus.py --tokenizer <tokenizer目录> --synthetic 64`
-   先把 chat template 验死,顺手产出冒烟语料。
-4. 需要一张卡:`qwen36_35b_a3b_lora_smoke`(20 步)。看三件事 ——
-   日志里 `dense=0 grouped=40`、`冻结了 N 个非 adapter 参数`、adapter 分片落盘。
-5. 需要 8 张卡:bf16 基线评测 + 3bit 裸版评测(复用
-   `eval_qwen3.6-35b_vllm`,`HIF4_MODE=off` + `MODEL_PATH` 覆盖,**两次必须给
-   不同的 `TAG`**,否则第二次会 resume 第一次的生成结果)。
-6. 需要 8 张卡:`qwen36_35b_a3b_lora_r16` 正式训练 → `merge_lora.py` → 复评。
-7. 2bit:`offline_ptq.py --hessian identity`,**不需要校准数据**,先出一版
-   (发现三);要上真 Hessian 再补抓激活那一步。RTN 在 2bit 不可用。
-8. 2bit 混精:`mp_select.py` 挑热专家 → `offline_ptq.py --keep-hot`。
-   **这一步必须有真激活**(路由计数没有 H=I 那种免校准退路),但它要的
-   token 数比 Hessian 少得多 —— 计数稳定比 `xe^T xe` 稳定容易。
-   先定用 hot11(同位宽预算)还是 hot26(同保留比例),见发现六。
+见最前面的"完整流程:从头到尾":十步的顺序、每一步的命令、"现在做到哪了"和
+"哪些步骤是实际跑通过的"都在那里。原先放在这里的清单已经并进去了。
 
 ## 离线 PTQ 怎么跑
 

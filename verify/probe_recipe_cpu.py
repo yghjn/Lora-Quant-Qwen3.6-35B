@@ -164,6 +164,20 @@ if last is not None:
 else:
     check("至少有一个配置构造成功", False)
 
+print("\n== 总步数(给 adapter 保存器用:最后一步一定保存)")
+_argv = list(sys.argv)
+try:
+    sys.argv = ["train"]
+    a = R._effective_steps(256)
+    sys.argv = ["train", "--module", "x", "--training.steps", "5"]
+    b = R._effective_steps(256)
+    sys.argv = ["train", "--training.steps=7"]
+    c = R._effective_steps(256)
+finally:
+    sys.argv = _argv
+check("命令行没给 --training.steps 时用配置里的值;给了以命令行为准(两种写法)",
+      (a, b, c) == (256, 5, 7), f"{(a, b, c)}(期望 (256, 5, 7))")
+
 print("\n== Triton 的编译器包装")
 _cc = os.environ.get("CC", "")
 check("导入 recipe 之后 CC 指向 env/triton_cxx.sh,且可执行",

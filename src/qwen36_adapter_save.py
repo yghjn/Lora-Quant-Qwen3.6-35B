@@ -104,11 +104,16 @@ def save_adapters(model_parts, out_dir: str, step: int) -> int:
     return len(tensors)
 
 
-def register_adapter_saver(optimizers, model_parts) -> bool:
+def register_adapter_saver(optimizers, model_parts, total_steps=None) -> bool:
     """在优化器的 post-step 钩子上挂周期保存。返回是否挂上了。
 
     只挂**第一个**支持 `register_step_post_hook` 的优化器:每个优化器的 step 都会
     触发钩子,挂多个会让计数变成真实步数的倍数。
+
+    ``total_steps``:训练的总步数(整数,或一个调用时才求值的函数)。给了的话,
+    **最后一步一定保存**,不管它是不是 ``ADAPTER_SAVE_EVERY`` 的倍数。
+    不给就只按周期存 —— 那样 256 步配默认的每 100 步,最后一次保存停在第 200 步,
+    后 56 步白训,而且没有任何提示(2026-11-19 整理流程时发现,还没人踩到)。
     """
     out_dir = os.environ.get("ADAPTER_SAVE_DIR")
     if not out_dir:
@@ -119,18 +124,27 @@ def register_adapter_saver(optimizers, model_parts) -> bool:
         raise ValueError(f"ADAPTER_SAVE_EVERY 必须是正整数,得到 {every}")
     state = {"step": 0}
 
+    def _total() -> int:
+        try:
+            value = total_steps() if callable(total_steps) else total_steps
+            return int(value) if value else 0
+        except Exception:  # noqa: BLE001 - 求不出总步数就退回只按周期存
+            return 0
+
     def _hook(*_args, **_kwargs):
         state["step"] += 1
-        if state["step"] % every == 0:
+        if state["step"] % every == 0 or state["step"] == _total():
             save_adapters(model_parts, out_dir, state["step"])
 
     opts = list(optimizers)
     for opt in opts:
         if hasattr(opt, "register_step_post_hook"):
             opt.register_step_post_hook(_hook)
+            total = _total()
             logger.info(
-                "adapter 保存已注册: 每 %d 步 -> %s(挂在 %s 上;共 %d 个优化器,只挂一个)",
-                every, out_dir, type(opt).__name__, len(opts),
+                "adapter 保存已注册: 每 %d 步%s -> %s(挂在 %s 上;共 %d 个优化器,只挂一个)",
+                every, f",以及最后一步(第 {total} 步)" if total else "(不知道总步数,最后一步不保证保存)",
+                out_dir, type(opt).__name__, len(opts),
             )
             return True
     logger.warning("没有优化器支持 register_step_post_hook —— adapter 不会被保存")

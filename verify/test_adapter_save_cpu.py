@@ -172,5 +172,40 @@ with tempfile.TemporaryDirectory() as d:
     check("merge_lora 读旧分片时也能规范化(原名 -> 规范名)",
           sorted(M.canonical_name(n) for n in raw) == want)
 
+print("== G. 最后一步一定保存(总步数不是保存周期的倍数时)")
+# 正式配置是 256 步,ADAPTER_SAVE_EVERY 默认 100:只按周期存的话最后一次停在第 200 步,
+# 后 56 步白训,没有任何提示。给了 total_steps 之后最后一步必存。
+
+
+def run_total(every: int, steps: int, out_dir: str, total):
+    net = Net()
+    opt = torch.optim.AdamW([p for n, p in net.named_parameters() if "lora_" in n], lr=1e-2)
+    os.environ["ADAPTER_SAVE_DIR"] = out_dir
+    os.environ["ADAPTER_SAVE_EVERY"] = str(every)
+    S.register_adapter_saver([opt], [net], total_steps=total)
+    for _ in range(steps):
+        opt.zero_grad()
+        (net.inner_experts.w13_lora_a.sum() + net.inner_experts.w1_lora_b.sum()).backward()
+        opt.step()
+    return sorted(os.listdir(out_dir))
+
+
+with tempfile.TemporaryDirectory() as d:
+    files = run_total(100, 7, d, 7)
+    check("周期 100、共 7 步:第 7 步存了", files == [S.shard_name(0, 7)], str(files))
+with tempfile.TemporaryDirectory() as d:
+    files = run_total(3, 7, d, 7)
+    check("周期 3、共 7 步:第 3、6、7 步", files == [S.shard_name(0, s) for s in (3, 6, 7)], str(files))
+with tempfile.TemporaryDirectory() as d:
+    files = run_total(4, 8, d, lambda: 8)
+    check("总步数可以是函数;最后一步恰好是周期的倍数时不重复存",
+          files == [S.shard_name(0, 4), S.shard_name(0, 8)], str(files))
+with tempfile.TemporaryDirectory() as d:
+    files = run_total(100, 7, d, None)
+    check("不给总步数时只按周期存(老行为,7 步一片都没有)", files == [], str(files))
+with tempfile.TemporaryDirectory() as d:
+    files = run_total(100, 7, d, lambda: 1 / 0)
+    check("总步数求不出来时不炸,退回只按周期存", files == [], str(files))
+
 print(f"\n{passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
