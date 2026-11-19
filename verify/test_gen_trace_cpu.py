@@ -304,6 +304,43 @@ def main() -> int:
         check("--out 是个空文件时不用 --resume 也能跑(上次失败留下的)",
               p.returncode == 0 and len(read_jsonl(empty_out)) == 6, p.stdout[-300:] + p.stderr[-300:])
 
+        print("\n--- 服务中途不行了:连续失败就停,不空等 ---")
+        # 2026-11-18 第一次正式生成:服务在第 38 分钟不再响应,脚本把剩下的 753 条一条条等到
+        # 超时,空转了 16 个小时,"写出"一直停在 225。
+        streak_prompts = os.path.join(tmp, "streak.jsonl")
+        with open(streak_prompts, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"prompt": "一条正常的提问,服务还活着的时候" + PAD}, ensure_ascii=False) + "\n")
+            for i in range(30):
+                fh.write(json.dumps({"prompt": f"CASE_500 第 {i} 条,服务已经不行了" + PAD}, ensure_ascii=False) + "\n")
+        streak_out = os.path.join(tmp, "streak_out.jsonl")
+        n_req = len(RECEIVED)
+        p = run(GEN, "--prompts", streak_prompts, "--url", url, "--model", "fake", "--n", "0", "--par", "1",
+                "--max-fail-streak", "5", "--out", streak_out)
+        sent = len(RECEIVED) - n_req
+        written = read_jsonl(streak_out) if os.path.exists(streak_out) else []
+        check("连续 5 条失败后停下,退出码非 0", p.returncode != 0 and "连续 5 条请求失败" in p.stdout,
+              p.stdout[-600:] + p.stderr[-300:])
+        check("剩下的提问不再发(31 条里只发了一部分)", 5 <= sent < 31, f"发了 {sent} 条")
+        check("说明还有几条没发,并提示重启服务后 --resume", "条提问没发" in p.stdout and "--resume" in p.stdout,
+              p.stdout[-500:])
+        check("报告了服务的 /health", "/health" in p.stdout, p.stdout[-400:])
+        check("停下之前写出的样本留着(如果那条正常的排在前面)", len(written) <= 1 and "下一步" not in p.stdout)
+        # 中间有成功就不算"连续":1 条失败 + 很多条成功,不该停
+        mixed_prompts = os.path.join(tmp, "mixed_fail.jsonl")
+        with open(mixed_prompts, "w", encoding="utf-8") as fh:
+            for i in range(12):
+                tag = "CASE_500 " if i % 2 else ""
+                fh.write(json.dumps({"prompt": f"{tag}交替的第 {i} 条" + PAD}, ensure_ascii=False) + "\n")
+        mixed_out = os.path.join(tmp, "mixed_out.jsonl")
+        p = run(GEN, "--prompts", mixed_prompts, "--url", url, "--model", "fake", "--n", "0", "--par", "1",
+                "--max-fail-streak", "7", "--out", mixed_out)
+        check("失败和成功交替时不触发(6 条失败但不连续),正常跑完",
+              p.returncode == 0 and len(read_jsonl(mixed_out)) == 6 and "中途停了" not in p.stdout,
+              p.stdout[-400:] + p.stderr[-300:])
+        check("截断率按服务回了话的条数算,不按提问总数", "服务回了话的" in run(
+            GEN, "--prompts", prompts, "--url", url, "--model", "fake", "--n", "0", "--exclude", evalset,
+            "--out", os.path.join(tmp, "trunc_rate.jsonl")).stdout)
+
         print("\n--- 思考开关:要和评测的方式一致 ---")
         # 本项目的评测默认关思考。关思考时生成提示以空的 <think></think> 结尾,模型直接作答;
         # 与之对应的训练样本是"不带 reasoning_content 的 assistant"。

@@ -432,6 +432,8 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=20, help="<=0 则不传")
     ap.add_argument("--par", type=int, default=24, help="并发数,略低于服务的 --max-num-seqs")
     ap.add_argument("--timeout", type=float, default=1800.0, help="单条请求超时(秒)")
+    ap.add_argument("--max-fail-streak", type=int, default=0,
+                    help="连续失败这么多条(其间没有一条成功)就停下,不再空等。默认 0 = 取并发数,最少 10")
     ap.add_argument("--min-chars", type=int, default=40)
     ap.add_argument("--max-chars", type=int, default=6000)
     ap.add_argument("--exclude", action="append", default=[],
@@ -508,14 +510,18 @@ def main() -> int:
     lock = threading.Lock()
     counts = {"写出": 0, "截断": 0, "没有推理": 0, "没有答案": 0, "关思考没生效": 0, "请求失败": 0}
     thinking_on = args.thinking == "on"
-    state = {"handled": 0}
+    state = {"handled": 0, "fail_streak": 0, "stopped": False, "skipped": 0}
+    # 连续失败这么多条、其间没有一条成功,就认为服务已经挂了或卡死,停下来。
+    # 2026-11-18 第一次正式生成:服务在第 38 分钟左右不再响应,脚本却把剩下的 753 条
+    # 一条一条等到超时,空转了 16 个小时。默认取并发数(一整轮都失败),最少 10。
+    fail_limit = args.max_fail_streak if args.max_fail_streak > 0 else max(args.par, 10)
 
     def tick() -> None:  # 调用方已持有 lock
         state["handled"] += 1
         if state["handled"] % 50 == 0:
             elapsed = time.time() - began
             eta = elapsed / state["handled"] * (len(prompts) - state["handled"])
-            print(f"    已处理 {state['handled']}/{len(prompts)}  写出 {counts['写出']}  "
+            print(f"    已处理 {state['handled']}/{len(prompts)}  写出 {counts['写出']}  失败 {counts['请求失败']}  "
                   f"{elapsed:.0f}s  eta {eta:.0f}s", flush=True)
     rtoks: list[int] = []
     ctoks: list[int] = []
@@ -524,6 +530,10 @@ def main() -> int:
     fh = open(args.out, "a", encoding="utf-8")
 
     def work(question: str) -> None:
+        with lock:
+            if state["stopped"]:  # 已经判定服务不行了,剩下的不再发
+                state["skipped"] += 1
+                return
         try:
             reply = ask(opener, args, question)
             choice = reply["choices"][0]
@@ -537,9 +547,15 @@ def main() -> int:
                 counts["请求失败"] += 1
                 if len(errors) < 3:
                     errors.append(repr(exc)[:300])
+                state["fail_streak"] += 1
+                if state["fail_streak"] >= fail_limit and not state["stopped"]:
+                    state["stopped"] = True
+                    print(f"\n  !! 连续 {state['fail_streak']} 条请求失败、其间没有一条成功(最近一个错误: "
+                          f"{repr(exc)[:120]})。停止发送,等已经发出去的请求返回 ...", flush=True)
                 tick()
             return
         with lock:
+            state["fail_streak"] = 0  # 服务还在正常回话
             tick()
             if finish == "length":
                 counts["截断"] += 1
@@ -585,10 +601,27 @@ def main() -> int:
         print(f"  !! {counts['关思考没生效']} 条在 --thinking off 下仍然带推理:服务端的 chat template 没理会 "
               "enable_thinking=False。这些已丢弃。")
         print("     全都是这样的话,检查服务用的模板是不是 Qwen3.6 自己的那份。")
+    answered = state["handled"] - counts["请求失败"]  # 服务真的回了话的条数
     if counts["截断"]:
         kept = "保留了" if args.keep_truncated else "丢掉了"
-        print(f"  截断率 {100 * counts['截断'] / len(prompts):.1f}%({kept})。偏高说明 --max-tokens 对这批提问太小,"
-              "留下来的会偏向短轨迹。")
+        print(f"  截断率 {100 * counts['截断'] / max(answered, 1):.1f}%(服务回了话的 {answered} 条里,{kept})。"
+              "偏高说明 --max-tokens 对这批提问太小,留下来的会偏向短轨迹。")
+    if state["stopped"]:
+        health = "没问到"
+        try:
+            parsed = urllib.parse.urlparse(args.url)
+            health_url = urllib.parse.urlunparse(parsed._replace(path="/health", query=""))
+            with opener.open(health_url, timeout=15) as resp:
+                health = f"HTTP {resp.status}"
+        except urllib.error.HTTPError as exc:
+            health = f"HTTP {exc.code}"
+        except Exception as exc:  # noqa: BLE001
+            health = f"连不上({type(exc).__name__})"
+        print(f"\n!! 中途停了:连续 {fail_limit} 条请求失败。还有 {state['skipped']} 条提问没发。")
+        print(f"   服务的 /health: {health}。200 而请求全都超时 = 引擎卡住了;503 = 引擎死了;"
+              "连不上 = 进程没了。")
+        print("   去看起服务的那个终端的日志(报错一般在它停止出 token 的那个时刻附近),重启服务后,")
+        print("   用同一条命令加 --resume 接着跑:已经写出的不会重问,失败的会重新问。")
 
     def pct(values: list[int]) -> str:
         v = sorted(values)
@@ -610,6 +643,8 @@ def main() -> int:
             hint = ["所有请求都失败了,这是连接或服务的问题,不是提问的问题。", f"第一个错误: {errors[0]}"]
         die("一条都没写出来。", *hint)
     print(f"  耗时 {(time.time() - began) / 60:.1f} 分钟 -> {args.out}")
+    if state["stopped"]:
+        return 3  # 写出的那些留着,但这一趟没跑完
     print("\n下一步(验模板、数 token、丢掉训练装不下的):")
     print(f"    python src/prepare_corpus.py --tokenizer <checkpoint 目录> --src {args.out} "
           "--seq-len 4096 --out corpus.jsonl")
