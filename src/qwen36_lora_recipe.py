@@ -262,6 +262,55 @@ def _effective_steps(default: int) -> int:
     return int(default)
 
 
+# 训练配置的 seq_len。prepare_corpus.py --seq-len 要填同一个数(对不上会拒绝启动)。
+SEQ_LEN = 4096
+# 只在"语料文件不存在"时用(纯 CPU 的探针拿占位路径构造配置)—— 真训练走不到这里,
+# 因为读语料那一步就会报找不到文件。
+FALLBACK_STEPS = 256
+
+
+def _world_size() -> int:
+    """这次起了几个进程(= 几张卡)。torchrun 给每个进程设 ``WORLD_SIZE``。"""
+    for name in ("WORLD_SIZE", "NGPU"):
+        raw = (os.environ.get(name) or "").strip()
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+    return 8
+
+
+def _auto_steps() -> int:
+    """正式训练的步数:按语料量算(2026-11-19 起,不再写死 256)。
+
+    上游是把样本**拼满一行 seq_len** 再训的,一步吃 ``卡数 × seq_len`` 个 token 位置,
+    所以"一遍语料是多少步"取决于语料的 token 数,不是条数;写死的步数换一份语料就
+    不是原来的意思了(256 步对 2.5 M token 的语料约 3 遍,对 0.2 M 的约 37 遍)。
+    算法和依据见 ``qwen36_steps.py``。
+
+    * 命令行给了 ``--training.steps N``:用 N,不看语料。
+    * 否则读 ``$DATA_FILES.meta.json``(``prepare_corpus.py --seq-len`` 写的),
+      步数 = 一遍的步数 × ``LORA_EPOCHS``(默认 3)。记录缺失、或者和语料对不上时
+      **拒绝启动**并说明怎么补 —— 悄悄退回一个固定步数正是要避免的事。
+    """
+    import qwen36_steps as S
+
+    cli = _effective_steps(-1)
+    if cli > 0:
+        logger.info("训练步数: %d(命令行 --training.steps 指定,不按语料算)", cli)
+        return cli
+    corpus = os.environ.get("DATA_FILES", "")
+    if not os.path.isfile(corpus):
+        logger.warning(
+            "训练步数: 语料文件 %r 不存在,步数暂记 %d(训练会在读语料时失败)", corpus, FALLBACK_STEPS
+        )
+        return FALLBACK_STEPS
+    try:
+        p = S.plan(corpus, SEQ_LEN, _world_size())
+    except S.StepsError as exc:
+        raise RuntimeError(f"正式训练的步数算不出来。\n{exc}") from None
+    logger.info("训练步数: %s(%s 可改遍数)", S.describe(p), S.EPOCHS_ENV)
+    return p["steps"]
+
+
 def _wire_adapter_saver(config: Trainer.Config, steps: int) -> Trainer.Config:
     """注册 adapter 落盘钩子(工单 §6.5)。
 
@@ -374,8 +423,11 @@ def _wire_npu_overrides(config: Trainer.Config) -> Trainer.Config:
     return config
 
 
-def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
+def _base_lora_config(rank: int, alpha: float, steps: int | None = None) -> Trainer.Config:
+    """``steps=None``(正式配置):按语料量算,见 ``_auto_steps``。"""
     logger.info("Triton 编译器: %s", _TRITON_COMPILER_NOTE)
+    if steps is None:
+        steps = _auto_steps()
     config = qwen35_35b_a3b()
     config = _wire_weights(config)
     config = _wire_npu_overrides(config)
@@ -416,7 +468,7 @@ def _base_lora_config(rank: int, alpha: float, steps: int) -> Trainer.Config:
     config.training = replace(
         config.training,
         local_batch_size=1,
-        seq_len=4096,
+        seq_len=SEQ_LEN,
         steps=steps,
     )
     config.metrics = replace(config.metrics, log_freq=1)
@@ -443,14 +495,15 @@ def qwen36_35b_a3b_lora_smoke() -> Trainer.Config:
 
 
 def qwen36_35b_a3b_lora_r16() -> Trainer.Config:
-    """交付用:rank 16 / alpha 32(scaling 2),256 步。
+    """交付用:rank 16 / alpha 32(scaling 2)。步数按语料量算(``_auto_steps``:
+    一遍的步数 × ``LORA_EPOCHS``,默认 3 遍),命令行 ``--training.steps N`` 可以直接指定。
 
     初始权重必须是阶段 1(RTN 3bit)或阶段 2(LDLQ)的**假量化 bf16
     checkpoint** —— adapter 要补偿的就是那一份具体的量化误差,
     载成原始权重训出来的 adapter 放到量化基座上是另一回事(工单 §6.4)。
     启动时确认日志里没有"保持随机初始化"一类告警。
     """
-    return _base_lora_config(DEFAULT_RANK, DEFAULT_ALPHA, steps=256)
+    return _base_lora_config(DEFAULT_RANK, DEFAULT_ALPHA)
 
 
 def qwen36_35b_a3b_lora_r4() -> Trainer.Config:
@@ -459,5 +512,6 @@ def qwen36_35b_a3b_lora_r4() -> Trainer.Config:
     DSv4.1 的教训:rank16 的 adapter 是 4.22 B 可训参数而 trace 语料只有
     1.62 M token,严重欠定,于是他们退到 rank 2。Qwen3.6 单专家 rank4
     约 34 K 参数,按 top-8/256 摊算所需 token 量比 DSv4.1 宽松得多。
+    步数和 r16 一样按语料量算。
     """
-    return _base_lora_config(4, 8.0, steps=256)
+    return _base_lora_config(4, 8.0)

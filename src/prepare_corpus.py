@@ -371,15 +371,17 @@ def main() -> int:
     if not kept:
         _die("一条样本都没有。", "给 --src,或者用 --synthetic N 生成内置样本跑冒烟。")
 
-    # 数 token 用的 tokenizer。上游(text_datasets.py 的 _tokenize_sample)的判据是
-    # "整段渲染结果去掉结尾换行、编码、补上 EOS 之后,len - 1 > seq_len 就丢"。
+    # 数 token 用的 tokenizer。数的是"这条样本在训练的一行里占几个位置",
+    # 算法照上游 text_datasets.py 的 _tokenize_sample,见下面循环里的注释。
     tok = None
+    eos_id = None
     if args.seq_len > 0:
         tok_path = os.path.join(args.tokenizer, "tokenizer.json")
         try:
             from tokenizers import Tokenizer
 
             tok = Tokenizer.from_file(tok_path)
+            eos_id = tok.token_to_id("<|im_end|>")
         except ImportError:
             _die("--seq-len 需要 tokenizers 包。", "训练环境里有;或者去掉 --seq-len(那样就不数 token 了)。")
         except Exception as exc:  # noqa: BLE001
@@ -409,8 +411,14 @@ def main() -> int:
             if reasoning.strip()[:200] not in text:
                 reasoning_lost += 1
         if tok is not None:
-            n = len(tok.encode(text.rstrip(chr(10))).ids)
-            if n > args.seq_len:  # 上游:补 EOS 后 len-1 > seq_len 即丢,等价于 n > seq_len
+            # 上游(_tokenize_sample):整段去掉结尾换行后编码;结尾不是 EOS 就补一个;
+            # 输入是去掉最后一个 token 的那一段,它的长度超过 seq_len 就丢。
+            # Qwen 的 EOS 是 <|im_end|>,模板渲出来本来就以它结尾,所以输入长度 = 编码长度 - 1。
+            # 2026-11-19 用上游真的 ChatDataset 逐条对过(verify/probe_steps_upstream_cpu.py);
+            # 之前这里按"编码长度"算,每条多数了 1。
+            ids = tok.encode(text.rstrip(chr(10))).ids
+            n = len(ids) - 1 if (eos_id is not None and ids and ids[-1] == eos_id) else len(ids)
+            if n > args.seq_len:
                 over_len += 1
                 continue
             ntoks.append(n)
@@ -462,11 +470,38 @@ def main() -> int:
         v = sorted(ntoks)
         n = len(v)
         print(f"token 数/条: min {v[0]} p25 {v[n // 4]} 中位 {v[n // 2]} p75 {v[3 * n // 4]} max {v[-1]}")
-        print(f"token 合计:  {sum(v) / 1e6:.2f} M  (256 步 × 每步 8 条 × {args.seq_len} 最多能吃 "
-              f"{256 * 8 * args.seq_len / 1e6:.1f} M)")
+        print(f"token 合计:  {sum(v) / 1e6:.2f} M")
 
     if failed:
         _die(f"{failed} 条渲染失败 —— 工单 §6.6 的验收要求是 0。")
+
+    # 正式训练的步数是按语料量算的(qwen36_steps.py):把每条的 token 数记在语料旁边,
+    # 训练配置读它。没数 token(没给 --seq-len)就没有这份记录。
+    print("\n=== 3. 正式训练的步数 ===")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import qwen36_steps as S
+
+    if ntoks:
+        meta = S.write_meta(args.out, ntoks, args.seq_len)
+        print(f"每条的 token 数已记到: {meta}")
+        try:
+            epochs = S.epochs_from_env()
+            p = S.plan_from_ntoks(ntoks, args.seq_len, S.DEFAULT_WORLD, epochs)
+            print(S.describe(p))
+            print(f"(训练时一行不是一条样本:上游把样本拼满 {args.seq_len} token 再训。"
+                  f"遍数用环境变量 {S.EPOCHS_ENV} 改,默认 {S.DEFAULT_EPOCHS:g};"
+                  f"或者命令末尾加 --training.steps N 直接定步数)")
+            if p["tokens"] < 2_000_000:
+                print(f"注意: token 合计 {p['tokens'] / 1e6:.2f} M,低于建议的 2 M。"
+                      "跑冒烟够用;正式训练会把这点语料反复过,容易学成背答案。")
+        except S.StepsError as exc:
+            print(f"注意: 步数算不出来 —— {exc}")
+    else:
+        stale = S.meta_path(args.out)
+        if os.path.isfile(stale):
+            os.remove(stale)
+        print("没给 --seq-len,没数 token:冒烟配置不受影响(它是固定步数);")
+        print("正式配置(lora_r16 / lora_r4)会拒绝启动,除非命令末尾加 --training.steps N。")
 
     print("\n下一步:")
     print(f"    export DATA_FILES={os.path.abspath(args.out)}")

@@ -181,6 +181,10 @@ conda activate lqq-train && python src/prepare_corpus.py --tokenizer $CKPT --src
 看结尾的"token 合计":**目标 200 万以上**(DSv4.1 最大一版是 280 万,当时仍嫌不够)。
 不够就回去加大 `--n` 续跑,再整理一次。
 
+输出最后一段"=== 3. 正式训练的步数 ==="会报这份语料**过一遍是多少步**、默认 3 遍一共多少步
+(第 8 步用)。它同时在语料旁边写一个 `corpus.jsonl.meta.json`,记着每条样本的 token 数 ——
+**这两个文件要放在一起**,挪语料时一起挪;语料之后再有改动,就重新整理一次。
+
 ### 第 6 步:停服务,跑两组基线评测
 
 在服务的终端按 `Ctrl+C`,然后确认卡空出来了:
@@ -242,14 +246,37 @@ cd $REPO && python src/merge_lora.py --base $Q3 --adapter $WORK/adapter_smoke --
 | `qwen36_35b_a3b_lora_r16` | 16 / 32 | 语料充足(token 合计 200 万以上) |
 | `qwen36_35b_a3b_lora_r4` | 4 / 8 | 语料偏少。参数量是 r16 的四分之一,不容易学成"背语料" |
 
-两个都是 256 步。命令(以 r16 为例;环境变量同第 7 步):
+**步数不用自己定,配置按语料量算。** 上游训练时不是一条样本占一行,而是把样本一条接一条
+**拼满 4096 token 一行**,8 张卡每步各吃一行。所以"把语料过一遍要多少步"看的是 token 数
+不是条数:大约是 `token 合计 ÷ (8 × 4096)`,再加上拼行时浪费的一二成位置 ——
+250 万 token 的语料,一遍大约 90 到 100 步。
+
+* 步数 = 一遍的步数 × 遍数。遍数默认 3,用环境变量 `LORA_EPOCHS` 改(可以是小数,如 `LORA_EPOCHS=1.5`)。
+* 这个数第 5 步整理语料时已经报过了;训练日志开头也有一行"训练步数: …"。
+* 想直接定步数:命令末尾加 `--training.steps N`,这时不看语料。
+* 配置读的是语料旁边的 `corpus.jsonl.meta.json`。它不在、或者语料在那之后改过,正式配置会
+  **拒绝启动**并说明怎么补(重跑一次第 5 步的 `prepare_corpus.py`,几秒钟)。
+  冒烟配置是固定步数,不受影响。
+
+默认 3 遍的来由:原先这里写死 256 步,对 250 万 token 的语料正好约 3 遍,所以语料达标时
+训练量和原先一样;语料少的时候步数会跟着少,不再把一小份语料翻来覆去地过
+(写死的 256 步对 20 万 token 的语料是三十多遍)。DSv4.1 是 400 步、16 卡、seq 2048,
+如果它也是拼满一行,粗算是 4 到 7 遍 —— 它的数据加载方式没核实过,只当参考。
+**多少遍最好,没有实测依据**:训练中每 64 步会存一份 adapter,可以拿中间的去合并评测做比较。
+
+"一遍"是对整体说的:各卡分到的 token 数不一样,先到头的卡自己从头再来,所以跑完一遍的步数时
+有的卡多看了几条、有的卡还差几条。算法和依据在 `src/qwen36_steps.py`;估算和上游真的数据集
+代码对拍过(`verify/probe_steps_upstream_cpu.py`:2848 条 / 409 万 token,估算一遍 160 步,实测 160 步)。
+
+命令(以 r16 为例;环境变量同第 7 步):
 
 ```bash
 cd ~/src/torchtitan-npu && NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3b_lora_r16 HF_ASSETS_PATH=$Q3 DATA_FILES=$WORK/corpus.jsonl ADAPTER_SAVE_DIR=$WORK/adapter_r16 ADAPTER_SAVE_EVERY=64 bash scripts/run_train.sh 2>&1 | tee $WORK/train_r16.log
 ```
 
 每 64 步存一次 adapter,**最后一步一定会存**。做完的标志是 `$WORK/adapter_r16/` 下有
-8 个 `adapter_r0X_step000256.safetensors`。开头几分钟先照第 7 步那张表核对一遍日志。
+8 个 `adapter_r0X_step<最后一步>.safetensors`(最后一步就是日志里报的总步数,六位数字补零)。
+开头几分钟先照第 7 步那张表核对一遍日志。
 **这一步还没有人跑过**,耗时和显存都没有实测数字。
 
 ### 第 9 步:把 adapter 合并进基座
@@ -310,6 +337,7 @@ python src/offline_ptq.py run --in $CKPT --out $WORK/qwen36-2bit --bits 2 --hess
 | 5 | 脚本跑通,产出过 225 条;大批量还没跑完过 |
 | 7 | 在**原始权重**上跑通(5 步,含合并试读);3bit 基座上没跑过 |
 | 6、8、9(写出)、10 | **没跑过** |
+| 步数按语料量算 | 纯 CPU 验过(自测 + 和上游数据集代码对拍);**真训练里没跑过** |
 | 2bit | 工具有自测,真权重上没跑过 |
 
 ### 细节在哪一节
@@ -431,6 +459,7 @@ src/
   qwen36_lora_compat.py    converter 兼容层:已提交的 lora.py 把根配置写死成 DSv4,Qwen 过不去
   qwen36_adapter_save.py   adapter 周期落盘(原先依赖的文件在干净 clone 里不存在)
   prepare_corpus.py        工单 §6.6:语料归一化 + chat template 前置验死 + 按 token 丢掉训练装不下的
+  qwen36_steps.py          正式训练的步数:按语料的 token 数算(一遍的步数 × LORA_EPOCHS)
   gen_trace.py             工单 §6.6:让基线模型自己生成推理轨迹当训练语料(移植自 DSv4.1)
   merge_lora.py            工单 §7.1/§7.2:adapter 合并回 bf16 checkpoint
   mp_select.py             工单 §4.1:按路由计数挑热专家 + 位宽账(--bits-table)
@@ -439,6 +468,7 @@ verify/
   test_fakequant_cpu.py    端到端自测,合成 checkpoint
   test_offline_ptq_cpu.py  PTQ 自测,55 项,含 2bit 三档对比
   test_merge_lora_cpu.py   合并自测,26 项,纯 CPU,参考值用 einsum 独立算
+  test_steps_cpu.py        步数计算自测,46 项;拼行逻辑和照抄上游的参照实现逐例对拍
   test_gen_trace_cpu.py    轨迹生成自测,57 项,本机起一个假的 OpenAI 兼容服务,产物再过 prepare_corpus
   test_mp_select_cpu.py    混合精度自测,60 项,含位宽口径与 --keep-hot 端到端
   test_adapter_save_cpu.py adapter 落盘自测,26 项,只需 torch + safetensors
@@ -446,6 +476,7 @@ verify/
   probe_recipe_cpu.py      训练配置能否 import / 构造(需训练环境;安装脚本的闸门 5)
   probe_parallelize_cpu.py 8 个 CPU 进程把整个模型真的并行化一遍(安装脚本的闸门 6)
   probe_triton_launcher_cpu.py  Triton kernel 的 C++ 启动代码在本机编不编得出来(闸门 7)
+  probe_steps_upstream_cpu.py  步数估算和上游真的 ChatDataset 对拍(要 tokenizer 目录和整理好的语料)
   probe_weights_map_cpu.py checkpoint 的键和形状与模型是否对得上(要 checkpoint 目录,起训练前跑)
 ```
 
@@ -811,7 +842,7 @@ cd ~/src/torchtitan-npu && NGPU=8 MODULE=qwen36_lora_recipe CONFIG=qwen36_35b_a3
 一张 60 GB 的卡装不下。
 
 这几个环境变量(`HF_ASSETS_PATH` / `DATA_FILES` / `ADAPTER_SAVE_DIR` /
-`ADAPTER_SAVE_EVERY`,以及可选的 `INITIAL_LOAD_PATH`)是 **`qwen36_lora_recipe`
+`ADAPTER_SAVE_EVERY`,以及可选的 `INITIAL_LOAD_PATH`、`LORA_EPOCHS`)是 **`qwen36_lora_recipe`
 自己读的**。`scripts/run_train.sh` 只认 `NGPU` / `MODULE` / `CONFIG`,换成别的
 MODULE 时 `HF_ASSETS_PATH=...` 这种写法不会生效,也不会报错。
 
@@ -1121,7 +1152,8 @@ Qwen3.6 的模板在生成提示的结尾有两种写法,训练样本渲出来�
 三种都处理了,但没对真服务试过)。
 
 规模参考:DSv4.1 最大一版 2.8 M token,且因为数据不够把 rank 降到了 2。我们的正式配置
-(256 步 × 每步 8 条 × 4096)最多能吃 8.4 M token;语料少就用 `qwen36_35b_a3b_lora_r4`。
+的步数按语料量算(默认过 3 遍,见"完整流程"第 8 步);语料少就用 `qwen36_35b_a3b_lora_r4`。
+(这里原先写的是"256 步 × 每步 8 条",不对:上游把样本拼满 4096 token 一行,一行不是一条。)
 
 ## §0.1 闸门怎么跑(从零开始的完整流程)
 

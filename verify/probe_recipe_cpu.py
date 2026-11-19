@@ -25,7 +25,9 @@
 6. NPU 的 GDN kernel override 在 `override.imports` 里,并且那个名字真的存在;
    权重适配器是本仓库的 `Qwen36StateDictAdapter`;MoE 负载均衡偏置已关;
 7. 把训练启动器的参数解析原样走一遍:`--training.steps 5` 生效,
-   前面几条在解析之后仍然成立。
+   前面几条在解析之后仍然成立;
+8. 正式配置(r16 / r4)的步数按语料量算:一遍的步数 × `LORA_EPOCHS`;
+   token 数记录缺失或和语料对不上时拒绝构造;命令行给了步数就用命令行的。
 
 退出码:0 通过;1 判据不成立;2 import 期失败(环境问题)。
 """
@@ -42,6 +44,9 @@ os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", "")
 os.environ["HF_ASSETS_PATH"] = "/nonexistent-hf-assets-dir"
 os.environ["DATA_FILES"] = "/nonexistent-corpus.jsonl"
 os.environ.pop("INITIAL_LOAD_PATH", None)
+# 正式配置的步数是按语料量、卡数、遍数算的;这三个也固定下来
+for _name in ("WORLD_SIZE", "NGPU", "LORA_EPOCHS"):
+    os.environ.pop(_name, None)
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 if _SRC not in sys.path:
@@ -177,6 +182,77 @@ finally:
     sys.argv = _argv
 check("命令行没给 --training.steps 时用配置里的值;给了以命令行为准(两种写法)",
       (a, b, c) == (256, 5, 7), f"{(a, b, c)}(期望 (256, 5, 7))")
+
+print("\n== 正式训练的步数:按语料量算(qwen36_steps.py)")
+import json as _json  # noqa: E402
+import tempfile  # noqa: E402
+
+import qwen36_steps as _S  # noqa: E402
+
+_NOFILE = os.environ["DATA_FILES"]
+
+
+def _steps_of(fn: str) -> int:
+    return getattr(R, fn)().training.steps
+
+
+def _steps_raises(*want: str) -> tuple[bool, str]:
+    try:
+        n = _steps_of("qwen36_35b_a3b_lora_r16")
+        return False, f"没抛异常,steps={n}"
+    except RuntimeError as exc:
+        return all(w in str(exc) for w in want), str(exc).replace("\n", " | ")[:60]
+    except BaseException as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+try:
+    check("语料文件不存在时(本探针的占位路径)步数记 256,不在这里报错",
+          _steps_of("qwen36_35b_a3b_lora_r16") == R.FALLBACK_STEPS == 256)
+    with tempfile.TemporaryDirectory() as _tmp:
+        _corpus = os.path.join(_tmp, "corpus.jsonl")
+        with open(_corpus, "w", encoding="utf-8") as _fh:
+            for _i in range(80):
+                _fh.write(_json.dumps({"messages": [{"role": "user", "content": str(_i)}]}) + "\n")
+        _meta = _S.write_meta(_corpus, [1000] * 80, R.SEQ_LEN)
+        os.environ["DATA_FILES"] = _corpus
+        # 80 条 × 1000 token、8 卡:每卡 10 条,一行拼 4 条 -> 一遍 3 步
+        got = (_steps_of("qwen36_35b_a3b_lora_r16"), _steps_of("qwen36_35b_a3b_lora_r4"))
+        check("r16 / r4:一遍 3 步 × 默认 3 遍 = 9 步", got == (9, 9), f"{got}")
+        check("冒烟配置不受影响,还是固定 20 步", _steps_of("qwen36_35b_a3b_lora_smoke") == 20)
+        os.environ["LORA_EPOCHS"] = "1"
+        check("LORA_EPOCHS=1 -> 3 步", _steps_of("qwen36_35b_a3b_lora_r16") == 3)
+        os.environ.pop("LORA_EPOCHS")
+        os.environ["WORLD_SIZE"] = "4"
+        check("卡数取 torchrun 设的 WORLD_SIZE(4 卡:一遍 5 步 -> 15 步)",
+              _steps_of("qwen36_35b_a3b_lora_r16") == 15)
+        os.environ.pop("WORLD_SIZE")
+        _cfg = R.qwen36_35b_a3b_lora_r16()
+        check("warmup 和保存间隔跟着算出来的步数走",
+              _cfg.lr_scheduler.warmup_steps == 1 and _cfg.checkpoint.interval == 9,
+              f"warmup={_cfg.lr_scheduler.warmup_steps} interval={_cfg.checkpoint.interval}")
+
+        with open(_corpus, "a", encoding="utf-8") as _fh:
+            _fh.write("{}\n")
+        good, msg = _steps_raises("改过", "prepare_corpus.py")
+        check("语料在数完 token 之后改过 -> 拒绝构造,并说怎么重跑", good, msg)
+        os.remove(_meta)
+        good, msg = _steps_raises("找不到", "--training.steps")
+        check("没有 token 数记录 -> 拒绝构造(不悄悄退回固定步数)", good, msg)
+        _argv2 = list(sys.argv)
+        try:
+            sys.argv = ["train", "--training.steps", "7"]
+            check("命令行给了 --training.steps 7 -> 用 7,不需要记录",
+                  _steps_of("qwen36_35b_a3b_lora_r16") == 7)
+        finally:
+            sys.argv = _argv2
+except BaseException as exc:  # noqa: BLE001
+    traceback.print_exc()
+    check("步数这一段能走通", False, f"{type(exc).__name__}: {exc}")
+finally:
+    os.environ["DATA_FILES"] = _NOFILE
+    for _name in ("WORLD_SIZE", "LORA_EPOCHS"):
+        os.environ.pop(_name, None)
 
 print("\n== Triton 的编译器包装")
 _cc = os.environ.get("CC", "")
