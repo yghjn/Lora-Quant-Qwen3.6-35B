@@ -363,11 +363,21 @@ softmax 还是 sigmoid、归不归一化都不影响 —— topk 只看 logits �
 于是要卡要模型的部分压到只剩**抓各层 MoE 输入的 hidden states**(每层一个
 `[N, dim]`),其余全在 `src/offline_ptq.py` 里且可测(55 项自测)。
 
+**2026-11-20 补:抓激活的代码有了,3bit 也改走这条路。**
+`src/qwen36_capture_acts.py` 挂在训练进程上抓(`CONFIG=qwen36_35b_a3b_capture_acts`:
+和正式训练同一条路,学习率 0,LoRA 的 B 保持全零,所以模型就是原始权重)。
+起因是 §1.1 的 RTN 3bit 被当成了正式基座:在它上面训完 LoRA 之后,MATH-500 掉点在 1 以内,
+另外两个评测集明显下降(LiveCodeBench 约 15 分)。§1.1 原本就写着 RTN 的数"不作为交付参照",
+而 DSv4.1 没有用过 RTN。现在 3bit 和 2bit 都用 `offline_ptq.py` + 真激活,
+RTN 只留作确认管道通的脚手架。步骤见 README 的"完整流程"第 6、7 步。
+
 **另外补一条原文没有的验收点:`--gate-up-order`。**
 `a = silu(gate) * up`,融合顺序反了 `a` 整个变样,`H2` 跟着错,w2 的量化也错 ——
 **而 SNR 完全看不出来**,因为 SNR 只看 `||W - Ŵ||`,不看 H。这是会静默产出
 垃圾的一类,和 §C.2 里点过的 `cmd.json` 残留导致零 Hessian 是同一类失败。
 判法:一条校准数据两种顺序各算一次 logits,和 bf16 基座对齐的那个是对的。
+(2026-11-20 落地成 `qwen36_capture_acts.py check`:抓激活时顺带存一小份专家模块的真实
+输入和输出,用 checkpoint 的权重按两种顺序各重算一遍。)
 
 **2.5 的变更(2026-11-06)。**
 原条目假设 PTQ 先吐一个中间产物格式,再由 `write_dequant_ckpt.py` 转成 HF

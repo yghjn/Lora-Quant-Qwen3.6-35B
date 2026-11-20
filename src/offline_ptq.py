@@ -30,9 +30,10 @@ states 之后,topk_ids、每专家的 xe、`a = swiglu(xe @ W13)`、两个 Hessi
 
     **抓各层 MoE 输入的 hidden states,每层存一个 [N, dim] 的张量。**
 
-那是约 40 行 forward hook,本文件**不含**它 —— 它依赖具体用哪个框架跑前向
-(torchtitan / HF),而那个环境还没建起来,写了也验不了。本文件消费它的产物:
-`--acts <目录>`,每层一个 `layer<NN>.pt`,内容是 `[N, dim]` 的 bf16/fp32 张量。
+那段 forward hook 在 `qwen36_capture_acts.py` 里(2026-11-20 补上;挂在训练进程上,
+`CONFIG=qwen36_35b_a3b_capture_acts`)。本文件消费它的产物:
+`--acts <目录>`,每层要么一个 `layer<NN>.pt`(`[N, dim]` 的 bf16/fp32 张量),
+要么一个 `layer<NN>/` 目录、里面若干个这样的分片(抓出来的就是这种)。
 `--acts` 的格式校验在 `load_acts` 里,形状和 dtype 不对会直接抛。
 
 剩下的全部可测,`verify/test_offline_ptq_cpu.py` 覆盖。
@@ -59,8 +60,10 @@ states 之后,topk_ids、每专家的 xe、`a = swiglu(xe @ W13)`、两个 Hessi
   **这里比合并那边更要紧**:`a = silu(gate) * up`,顺序弄反会让 `a` 整个变样,
   于是 `H2` 是错的,w2 的量化跟着错 —— 而 SNR 看着仍然正常,
   因为 SNR 只看 `||W - Ŵ||`,不看 H。这是会静默产出垃圾的那一类。
-  判据:拿一条校准数据,两种顺序各算一次 logits,和 bf16 基座对齐的那个是对的;
-  或者直接看官方的 modeling 代码。本脚本把实际用的顺序记进 manifest。
+  判据:`qwen36_capture_acts.py check --acts <目录> --in <ckpt>` —— 抓激活时顺带存了
+  一小份专家模块的真实输入和输出,它用两种顺序各重算一次,对得上的那个是对的。
+  (vLLM 的加载代码和本仓库的 `qwen36_state_dict_adapter.py` 都是前一半 gate。)
+  本脚本把实际用的顺序记进 manifest。
 """
 
 from __future__ import annotations
@@ -86,6 +89,7 @@ _DOWN_RE = re.compile(r"layers\.(\d+)\.mlp\.experts\.down_proj(\.weight)?$")
 # router:两种命名都见过,所以都认
 _ROUTER_RE = re.compile(r"layers\.(\d+)\.mlp\.(gate|router)\.weight$")
 _ACT_RE = re.compile(r"layer0*(\d+)\.pt$")
+_ACT_DIR_RE = re.compile(r"^layer0*(\d+)$")
 
 
 def die(msg: str, *lines: str):
@@ -324,18 +328,59 @@ def avg_bits_report(bits: int, keep: dict[int, set[int]] | None,
     }
 
 
+def _load_act_parts(parts_dir: str, dim: int) -> torch.Tensor:
+    """`layer<NN>/` 目录:里面每个 .pt 是一片 [n, dim],按文件名顺序拼起来。
+
+    这是 `qwen36_capture_acts.py` 的落盘格式(每张卡每一步一个文件)。
+    """
+    names = sorted(os.listdir(parts_dir))
+    tmp = [fn for fn in names if fn.endswith(".tmp")]
+    if tmp:
+        die(
+            f"{parts_dir} 里有没写完的分片: {tmp[0]}",
+            "抓激活那一步中途断过。先跑 qwen36_capture_acts.py check 看缺了什么;",
+            "确认其余分片可用的话,把 .tmp 文件删掉再来。",
+        )
+    parts = [fn for fn in names if fn.endswith(".pt")]
+    if not parts:
+        die(f"{parts_dir} 是空的,没有激活分片")
+    chunks = []
+    for fn in parts:
+        t = torch.load(os.path.join(parts_dir, fn), map_location="cpu", weights_only=True)
+        if not isinstance(t, torch.Tensor) or t.dim() != 2 or t.shape[-1] != dim:
+            shape = tuple(t.shape) if isinstance(t, torch.Tensor) else type(t).__name__
+            die(f"{os.path.join(parts_dir, fn)} 不是 [n, {dim}] 的张量(是 {shape})")
+        chunks.append(t)
+    return torch.cat(chunks, dim=0)
+
+
 def load_acts(acts_dir: str, layer: int, dim: int) -> torch.Tensor:
-    path = None
-    for fn in os.listdir(acts_dir):
+    """第 `layer` 层的 MoE 输入激活 `[N, dim]`。
+
+    两种放法都认:一个文件 `layer<NN>.pt`,或者一个目录 `layer<NN>/` 里放若干分片
+    (`qwen36_capture_acts.py` 抓出来的就是后者)。两种同时存在时拒绝,不猜用哪个。
+    """
+    path = parts_dir = None
+    for fn in sorted(os.listdir(acts_dir)):
+        full = os.path.join(acts_dir, fn)
         m = _ACT_RE.search(fn)
-        if m and int(m.group(1)) == layer:
-            path = os.path.join(acts_dir, fn)
-            break
+        if m and int(m.group(1)) == layer and os.path.isfile(full) and path is None:
+            path = full
+        m = _ACT_DIR_RE.match(fn)
+        if m and int(m.group(1)) == layer and os.path.isdir(full) and parts_dir is None:
+            parts_dir = full
+    if path is not None and parts_dir is not None:
+        die(
+            f"第 {layer} 层的激活有两份: {path} 和 {parts_dir}/",
+            "不知道该用哪个 —— 留一个。",
+        )
+    if parts_dir is not None:
+        return _load_act_parts(parts_dir, dim)
     if path is None:
         die(
-            f"{acts_dir} 下没有第 {layer} 层的激活文件",
-            "命名应为 layer<NN>.pt(例 layer20.pt),内容是 [N, dim] 的张量。",
-            "抓 hidden states 的那段 hook 不在本仓库 —— 见本文件 docstring。",
+            f"{acts_dir} 下没有第 {layer} 层的激活",
+            "应当有 layer<NN>.pt(一个 [N, dim] 的张量),或者 layer<NN>/ 目录(若干分片)。",
+            "怎么抓见 src/qwen36_capture_acts.py 的文件头,或 README 的'完整流程'。",
         )
     t = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(t, dict):
@@ -349,6 +394,99 @@ def load_acts(acts_dir: str, layer: int, dim: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------- 量化一层
+_CODEBOOKS: dict[int, tuple] = {}
+
+
+@torch.no_grad()
+def _quantize_expert(layer: int, e: int, w13e, w2e, h13e, h2e, ntok_e, bits: int, damp: float, use_ldlq: bool):
+    """一个专家的两个矩阵(都是 [out, in])。返回 (量化后的 w13, 量化后的 w2, 记录)。
+
+    `ntok_e`:这个专家分到的校准 token 数;`None` 表示这次根本没有校准(H=I)。
+    调用方负责把线程数定成 1 —— 这样单进程和多进程的结果逐位相同。
+    """
+    if bits not in _CODEBOOKS:
+        _CODEBOOKS[bits] = (core.hadamard(core.HAD_BLOCK), core.LinearCodebook(core.D_GROUP, bits=bits))
+    Hd, cb = _CODEBOOKS[bits]
+    rec: dict = {"expert": e}
+    outs = []
+    for tag, W, H in (("w13", w13e, h13e), ("w2", w2e, h2e)):
+        out_n, in_n = W.shape
+        Wf = W.float()
+        degraded = False
+        if H is None:
+            Hm = torch.eye(in_n)
+            degraded = ntok_e is not None  # 有校准但这个专家没 token
+        elif ntok_e is not None and ntok_e == 0:
+            # 工单 §2.4 的验收点:ntok=0 必须被记成 DEGRADED,不能静默用零 Hessian。
+            # 零 Hessian 会让 LDLQ 的误差反馈完全失效,SNR 看着仍有 9 dB 量级。
+            Hm = torch.eye(in_n)
+            degraded = True
+        else:
+            Hm = H.float() / max(ntok_e, 1) if ntok_e is not None else H.float()
+        Hm = core.damp_hessian(Hm, damp)
+        Wh = core.unisvq_qdq(
+            Wf,
+            Hm,
+            core.rand_signs(in_n, sign_seed(layer, e, f"{tag}_in")),
+            core.rand_signs(out_n, sign_seed(layer, e, f"{tag}_out")),
+            Hd,
+            cb,
+            use_ldlq=use_ldlq,
+        )
+        rec[f"{tag}_snr"] = round(core.snr_db(Wf, Wh), 4)
+        rec[f"{tag}_proxy"] = core.proxy_loss(Wf, Wh, Hm)
+        if degraded:
+            rec[f"{tag}_degraded"] = True
+        outs.append(Wh.to(W.dtype))
+    return outs[0], outs[1], rec
+
+
+# ---- 进程池:张量过进程边界时走 numpy(按值拷贝)。不用 torch 默认的共享内存传法 ——
+# 那个要占 /dev/shm 和文件描述符,容器里 /dev/shm 往往只有 64 MB。
+def _to_wire(t):
+    if t is None:
+        return None
+    t = t.contiguous()
+    if t.dtype == torch.bfloat16:  # numpy 没有 bf16,当成 int16 的位模式传
+        return ("bf16", t.view(torch.int16).numpy())
+    return ("np", t.numpy())
+
+
+def _from_wire(w):
+    if w is None:
+        return None
+    kind, arr = w
+    t = torch.from_numpy(arr)
+    return t.view(torch.bfloat16) if kind == "bf16" else t
+
+
+def _worker_init() -> None:
+    torch.set_num_threads(1)
+
+
+def _quantize_task(packed):
+    layer, e, w13e, w2e, h13e, h2e, ntok_e, bits, damp, use_ldlq = packed
+    q13, q2, rec = _quantize_expert(
+        layer, e, _from_wire(w13e), _from_wire(w2e), _from_wire(h13e), _from_wire(h2e), ntok_e, bits, damp, use_ldlq
+    )
+    return _to_wire(q13), _to_wire(q2), rec
+
+
+def make_pool(jobs: int):
+    """`jobs` 个量化进程;`jobs <= 1` 返回 None(就在本进程里做)。
+
+    用 spawn 而不是 fork:本进程已经起过 BLAS 线程,fork 出来的子进程会卡死。
+    """
+    if jobs <= 1:
+        return None
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    # 子进程不需要 NPU;在装了 torch_npu 的环境里别让每个子进程都去初始化一遍设备。
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    return ProcessPoolExecutor(max_workers=jobs, mp_context=mp.get_context("spawn"), initializer=_worker_init)
+
+
 @torch.no_grad()
 def quantize_layer(
     w13: torch.Tensor,
@@ -361,65 +499,67 @@ def quantize_layer(
     damp: float,
     use_ldlq: bool,
     keep: set[int] | None = None,
+    pool=None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
     """w13 [E,2F,D] / w2 [E,D,F],都是 [out,in]。返回量化后的两个张量 + 每专家记录。
 
     `keep` 里的专家**原权重直通**(工单 §4.2 的混合精度回退),记 `kept: True`
     且**不记 SNR** —— 未量化矩阵的 SNR 是 +inf,混进统计会把 p50 推到无意义。
+
+    `pool`:`make_pool()` 给的进程池。专家之间互不相干,所以可以并行;每个专家都是
+    单线程算的(不给池子时本进程也临时切到单线程),结果和并行度无关。
+    单线程还更快:这里的运算都很小,线程多了反而互相抢(320 线程时每专家 3.4 秒,
+    单线程 1.0 秒,2026-11-20 开发机实测)。
     """
-    e_n, two_f, dim = w13.shape
-    hidden = two_f // 2
-    Hd = core.hadamard(core.HAD_BLOCK)
-    cb = core.LinearCodebook(core.D_GROUP, bits=bits)
+    e_n = w13.shape[0]
     out13 = torch.empty_like(w13)
     out2 = torch.empty_like(w2)
-    recs: list[dict] = []
-
+    recs: list[dict | None] = [None] * e_n
+    todo: list[int] = []
     for e in range(e_n):
-        rec: dict = {"expert": e}
         if keep and e in keep:
             out13[e] = w13[e]
             out2[e] = w2[e]
-            rec["kept"] = True
+            rec: dict = {"expert": e, "kept": True}
             if ntok is not None:
                 rec["ntok"] = int(ntok[e])
-            recs.append(rec)
-            continue
-        for tag, W, H, in_n, out_n in (
-            ("w13", w13[e], None if H13 is None else H13[e], dim, two_f),
-            ("w2", w2[e], None if H2 is None else H2[e], hidden, dim),
-        ):
-            Wf = W.float()
-            degraded = False
-            if H is None:
-                Hm = torch.eye(in_n)
-                degraded = ntok is not None  # 有校准但这个专家没 token
-            elif ntok is not None and int(ntok[e]) == 0:
-                # 工单 §2.4 的验收点:ntok=0 必须被记成 DEGRADED,不能静默用零 Hessian。
-                # 零 Hessian 会让 LDLQ 的误差反馈完全失效,SNR 看着仍有 9 dB 量级。
-                Hm = torch.eye(in_n)
-                degraded = True
-            else:
-                Hm = H.float() / max(int(ntok[e]), 1) if ntok is not None else H.float()
-            Hm = core.damp_hessian(Hm, damp)
-            Wh = core.unisvq_qdq(
-                Wf,
-                Hm,
-                core.rand_signs(in_n, sign_seed(layer, e, f"{tag}_in")),
-                core.rand_signs(out_n, sign_seed(layer, e, f"{tag}_out")),
-                Hd,
-                cb,
-                use_ldlq=use_ldlq,
-            )
-            rec[f"{tag}_snr"] = round(core.snr_db(Wf, Wh), 4)
-            rec[f"{tag}_proxy"] = core.proxy_loss(Wf, Wh, Hm)
-            if degraded:
-                rec[f"{tag}_degraded"] = True
-            (out13 if tag == "w13" else out2)[e] = Wh.to(W.dtype)
+            recs[e] = rec
+        else:
+            todo.append(e)
+
+    def args_of(e: int) -> tuple:
+        return (
+            layer, e, w13[e], w2[e],
+            None if H13 is None else H13[e],
+            None if H2 is None else H2[e],
+            None if ntok is None else int(ntok[e]),
+            bits, damp, use_ldlq,
+        )
+
+    if pool is None:
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            results = [_quantize_expert(*args_of(e)) for e in todo]
+        finally:
+            torch.set_num_threads(threads)
+    else:
+        def packed(e: int) -> tuple:
+            a = args_of(e)
+            return a[:2] + tuple(_to_wire(t) for t in a[2:6]) + a[6:]
+
+        results = [
+            (_from_wire(q13), _from_wire(q2), rec)
+            for q13, q2, rec in pool.map(_quantize_task, (packed(e) for e in todo))
+        ]
+
+    for e, (q13, q2, rec) in zip(todo, results):
+        out13[e] = q13
+        out2[e] = q2
         if ntok is not None:
             rec["ntok"] = int(ntok[e])
-        recs.append(rec)
-    return out13, out2, recs
+        recs[e] = rec
+    return out13, out2, recs  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------- 驱动
@@ -486,6 +626,8 @@ def cmd_run(args) -> int:
     print(f"Hessian            {'来自 ' + args.acts if use_hessian else 'identity(无校准)'}")
     print(f"阻尼               {args.damp}")
     print(f"LDLQ               {'开' if not args.no_ldlq else '关(退化成逐组码本量化)'}")
+    print(f"并行               {args.jobs} 个进程" if args.jobs > 1 else
+          "并行               单进程(--jobs N 可以并行;真权重 40 层单进程大约 3 小时)")
     print(f"层                 {len(layers)} 层: {layers if len(layers) <= 8 else str(layers[:8]) + '...'}")
     if keep:
         print(f"混合精度回退       {args.keep_hot}")
@@ -514,6 +656,7 @@ def cmd_run(args) -> int:
         "gate_up_order": args.gate_up_order,
         "hessian": "identity" if not use_hessian else os.path.abspath(args.acts),
         "damp": args.damp,
+        "jobs": args.jobs,
         "top_k": top_k if use_hessian else None,
         "num_experts": e_n,
         "dim": dim,
@@ -528,6 +671,7 @@ def cmd_run(args) -> int:
     # 量化结果按分片归集,最后一次性写出(一个分片可能含多层)
     patched: dict[str, dict[str, torch.Tensor]] = {}
     t0 = time.time()
+    pool = make_pool(args.jobs)
     for ln in layers:
         d = idx[ln]
         w13 = as_out_in(get_tensor(src, d["gate_up"][0], d["gate_up"][1]), layout)
@@ -550,7 +694,7 @@ def cmd_run(args) -> int:
 
         keep_ln = keep.get(ln) if keep else None
         q13, q2, recs = quantize_layer(
-            w13, w2, H13, H2, ntok, ln, args.bits, args.damp, not args.no_ldlq, keep_ln
+            w13, w2, H13, H2, ntok, ln, args.bits, args.damp, not args.no_ldlq, keep_ln, pool
         )
         patched.setdefault(d["gate_up"][0], {})[d["gate_up"][1]] = from_out_in(q13, layout)
         patched.setdefault(d["down"][0], {})[d["down"][1]] = from_out_in(q2, layout)
@@ -580,6 +724,9 @@ def cmd_run(args) -> int:
             "kept": sorted(keep_ln) if keep_ln else [],
             "experts": recs if args.full_manifest else None,
         }
+
+    if pool is not None:
+        pool.shutdown()
 
     # ---- 写出。只有被量化的层所在分片会重写,其余原样复制。
     print("\n================ 写出 ================")
@@ -680,7 +827,7 @@ def main() -> int:
 
     def common(p):
         p.add_argument("--in", dest="src", required=True, help="源 HF checkpoint 目录")
-        p.add_argument("--acts", help="各层 MoE 输入激活目录,每层一个 layer<NN>.pt")
+        p.add_argument("--acts", help="各层 MoE 输入激活目录(qwen36_capture_acts 抓的那个;每层一个 layer<NN>/ 或 layer<NN>.pt)")
         p.add_argument("--layers", help="要处理的层,如 20 / 0-3 / 0,5,9 / all(默认 all)")
         p.add_argument("--layout", choices=("auto", "efd", "edf"), default="auto")
         p.add_argument(
@@ -705,6 +852,9 @@ def main() -> int:
              "列进来的专家不量化、保持 bf16。平均位宽记进 manifest 和分片 metadata。",
     )
     pr.add_argument("--full-manifest", action="store_true", help="manifest 里记每个专家的 SNR/proxy")
+    pr.add_argument("--jobs", type=int, default=1,
+                    help="并行量化的进程数(默认 1)。每个专家单线程算,结果和进程数无关;"
+                         "真权重 40 层建议 32")
     pr.set_defaults(func=cmd_run)
 
     ph = sub.add_parser("hessian", help="只算 Hessian 存盘")

@@ -296,6 +296,66 @@ except BaseException as exc:  # noqa: BLE001
 finally:
     os.environ.pop("INITIAL_LOAD_PATH", None)
 
+print("\n== 抓激活的配置(qwen36_35b_a3b_capture_acts)")
+_CAP = "qwen36_35b_a3b_capture_acts"
+_CAP_ENV = ("CAPTURE_ACTS_DIR", "CAPTURE_TOKENS", "CAPTURE_LAYERS")
+for _name in _CAP_ENV:
+    os.environ.pop(_name, None)
+
+
+def _cap_raises(want: str) -> tuple[bool, str]:
+    try:
+        getattr(R, _CAP)()
+        return False, "没抛异常"
+    except RuntimeError as exc:
+        return want in str(exc), str(exc)[:46]
+    except BaseException as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+try:
+    import tempfile
+
+    good, msg = _cap_raises("CAPTURE_ACTS_DIR")
+    check("没设 CAPTURE_ACTS_DIR 时拒绝构造(否则这一趟什么都不留下)", good, msg)
+    os.environ["CAPTURE_ACTS_DIR"] = "acts"
+    good, msg = _cap_raises("绝对路径")
+    check("CAPTURE_ACTS_DIR 是相对路径时拒绝构造", good, msg)
+    os.environ["CAPTURE_ACTS_DIR"] = "/nonexistent-acts-dir"
+    cc = getattr(R, _CAP)()
+    check("默认 100 万个位置 -> 8 卡 × 4096 是 31 步", cc.training.steps == 31, f"steps={cc.training.steps}")
+    _lrs = [g.optimizer_kwargs.get("lr") for g in cc.optimizer.param_groups]
+    check("学习率是 0(模型保持等于加载进来的权重)", bool(_lrs) and all(v == 0.0 for v in _lrs), f"lr={_lrs}")
+    check("基座权重会被加载,且不保存全模型",
+          cc.checkpoint.enable is True and cc.checkpoint.initial_load_in_hf is True and cc.checkpoint.load_only is True)
+    check("挂的是抓激活的钩子,不是 adapter 落盘",
+          getattr(cc.model_spec.post_optimizer_build_fn, "__qualname__", "").startswith("_wire_capture"),
+          getattr(cc.model_spec.post_optimizer_build_fn, "__qualname__", "?"))
+    check("路由专家仍是 LoRA 配置(和正式训练同一条路)",
+          getattr(cc.model_spec.parallelize_fn, "__name__", "") == "_parallelize_lora")
+    os.environ["CAPTURE_TOKENS"] = "200000"
+    check("CAPTURE_TOKENS=200000 -> 7 步", getattr(R, _CAP)().training.steps == 7)
+    os.environ.pop("CAPTURE_TOKENS")
+    _argv = sys.argv
+    sys.argv = [_argv[0], "--training.steps", "3"]
+    try:
+        check("命令行给了 --training.steps 3 -> 用 3", getattr(R, _CAP)().training.steps == 3)
+    finally:
+        sys.argv = _argv
+    with tempfile.TemporaryDirectory() as _qdir:
+        open(os.path.join(_qdir, "fakequant_manifest.json"), "w").close()
+        os.environ["HF_ASSETS_PATH"] = _qdir
+        good, msg = _cap_raises("原始权重")
+        check("HF_ASSETS_PATH 指到量化后的目录时拒绝构造", good, msg)
+        os.environ["HF_ASSETS_PATH"] = _PLACEHOLDER
+except BaseException as exc:  # noqa: BLE001
+    traceback.print_exc()
+    check("抓激活的配置这一段能走通", False, f"{type(exc).__name__}: {exc}")
+finally:
+    os.environ["HF_ASSETS_PATH"] = _PLACEHOLDER
+    for _name in _CAP_ENV:
+        os.environ.pop(_name, None)
+
 print("\n== NPU GDN override 这个名字存在吗")
 try:
     import importlib

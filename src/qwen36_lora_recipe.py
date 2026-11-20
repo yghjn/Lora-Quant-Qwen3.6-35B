@@ -423,8 +423,38 @@ def _wire_npu_overrides(config: Trainer.Config) -> Trainer.Config:
     return config
 
 
-def _base_lora_config(rank: int, alpha: float, steps: int | None = None) -> Trainer.Config:
-    """``steps=None``(正式配置):按语料量算,见 ``_auto_steps``。"""
+def _wire_capture(config: Trainer.Config, steps: int) -> Trainer.Config:
+    """注册抓激活的钩子(代替 adapter 落盘)。和 ``_wire_adapter_saver`` 挂在同一个位置:
+    那时模型已经建好、并行化完,``model_parts`` 里就是训练真正会调用的那个模型。"""
+    spec = config.model_spec
+    prev = getattr(spec, "post_optimizer_build_fn", None)
+
+    def _hook(optimizers, model_parts, parallel_dims):
+        if prev is not None:
+            prev(optimizers, model_parts, parallel_dims)
+        import qwen36_capture_acts as C
+
+        C.install(
+            model_parts,
+            steps=_effective_steps(steps),
+            seq_len=SEQ_LEN,
+            world=_world_size(),
+            source=os.environ.get("HF_ASSETS_PATH"),
+            corpus=os.environ.get("DATA_FILES"),
+        )
+
+    config.model_spec = replace(spec, post_optimizer_build_fn=_hook)
+    return config
+
+
+def _base_lora_config(
+    rank: int, alpha: float, steps: int | None = None, wire_post=None
+) -> Trainer.Config:
+    """``steps=None``(正式配置):按语料量算,见 ``_auto_steps``。
+
+    ``wire_post``:建好优化器之后挂什么。默认是 adapter 落盘;抓激活的配置换成
+    ``_wire_capture``。
+    """
     logger.info("Triton 编译器: %s", _TRITON_COMPILER_NOTE)
     if steps is None:
         steps = _auto_steps()
@@ -436,7 +466,7 @@ def _base_lora_config(rank: int, alpha: float, steps: int | None = None) -> Trai
     # target_modules=() 只动路由专家,碰不到 embedding / lm_head,词表不变,
     # 所以沿用上游算好的那个值是对的。
     config.model_spec = _lora_model_spec(rank, alpha)
-    config = _wire_adapter_saver(config, steps)
+    config = (wire_post or _wire_adapter_saver)(config, steps)
 
     # 语料:prepare_corpus.py 产出的 jsonl,每行一个 {"messages": [...]}。
     config.dataloader = ChatDataLoader.Config(
@@ -504,6 +534,34 @@ def qwen36_35b_a3b_lora_r16() -> Trainer.Config:
     启动时确认日志里没有"保持随机初始化"一类告警。
     """
     return _base_lora_config(DEFAULT_RANK, DEFAULT_ALPHA)
+
+
+def qwen36_35b_a3b_capture_acts() -> Trainer.Config:
+    """抓各层 MoE 输入的激活,给 ``offline_ptq.py --acts`` 用。**不是训练。**
+
+    走的是和 r16 正式训练完全相同的路(同样的 converter、权重加载、8 卡并行、语料),
+    只改两处:学习率 0(LoRA 的 B 初值是零,所以模型自始至终严格等于加载进来的权重;
+    ``qwen36_capture_acts`` 每步都会核对),以及把 adapter 落盘换成抓激活的钩子。
+    选这条路而不是另写一套前向,是因为这条路在 8 张卡上已经跑通过。
+
+    * ``HF_ASSETS_PATH`` 必须是**原始权重** —— 指到量化后的目录会被拒绝。
+    * ``CAPTURE_ACTS_DIR`` 必填;``CAPTURE_TOKENS`` / ``CAPTURE_LAYERS`` 见
+      ``qwen36_capture_acts.py`` 的文件头。不需要 ``ADAPTER_SAVE_DIR``。
+    * 步数按 ``CAPTURE_TOKENS`` 算(默认 100 万个位置,8 卡 × 4096 是 31 步);
+      命令行 ``--training.steps N`` 优先。日志里的 loss 应当和原始权重上的冒烟训练
+      一样低 —— 它顺带说明权重确实加载进去了。
+    """
+    import qwen36_capture_acts as C
+
+    C.refuse_quantized_source(os.environ.get("HF_ASSETS_PATH", "").strip())
+    C.require_out_dir()
+    cli = _effective_steps(-1)
+    steps = cli if cli > 0 else C.planned_steps(SEQ_LEN, _world_size())
+    logger.info("抓激活: %d 步(%s)", steps, "命令行指定" if cli > 0 else f"按 {C.ENV_TOKENS} 算")
+    config = _base_lora_config(DEFAULT_RANK, DEFAULT_ALPHA, steps=steps, wire_post=_wire_capture)
+    # 学习率 0:B 保持全零 -> adapter 贡献恒为 0 -> 模型就是原始权重。
+    config.optimizer = default_adamw(lr=0.0, weight_decay=0.0)
+    return config
 
 
 def qwen36_35b_a3b_lora_r4() -> Trainer.Config:

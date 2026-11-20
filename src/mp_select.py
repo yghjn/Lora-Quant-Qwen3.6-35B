@@ -219,7 +219,7 @@ def report(cnt: dict[int, torch.Tensor], table: dict[str, list[int]], k: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--in", dest="src", help="源 HF checkpoint 目录")
-    ap.add_argument("--acts", help="各层 MoE 输入激活目录,每层一个 layer<NN>.pt")
+    ap.add_argument("--acts", help="各层 MoE 输入激活目录(qwen36_capture_acts 抓的那个;每层一个 layer<NN>/ 或 layer<NN>.pt)")
     ap.add_argument("--out", help="输出的 keep json(hot);cold 变体写成 <stem>_cold.json")
     ap.add_argument("--layers", help="参与统计的层,默认 all")
     ap.add_argument("-k", "--keep", type=int,

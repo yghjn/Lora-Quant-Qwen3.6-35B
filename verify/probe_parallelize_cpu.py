@@ -27,7 +27,9 @@
 ----
 1. 8 个进程的 `parallelize_fn` 都不抛异常;
 2. 每层路由专家的 5 个 adapter 和 3 个基座权重,本进程持有的专家数 = 总数 / EP;
-3. 可训参数只有 adapter(名字含 `lora_`),张量数 = 5 × 层数。
+3. 可训参数只有 adapter(名字含 `lora_`),张量数 = 5 × 层数;
+4. adapter 落盘的名字和切分方式 `merge_lora.py` 认得;
+5. 抓激活(`qwen36_capture_acts.py`)要挂钩子的模块,在并行化之后的真模型里都找得到。
 
 没验到的:真设备上的显存、权重加载、前向、反传 —— 那些只有上卡才有。
 
@@ -233,6 +235,16 @@ def worker(args: argparse.Namespace) -> int:
           bool(adapters) and not unknown and bool(placements) and all(_concat_ok(t) for t in placements),
           f"原名例 {adapters[0][0] if adapters else '-'};placements {placements}"
           + (f";认不出 {unknown[:2]}" if unknown else ""))
+
+    # 抓激活(qwen36_capture_acts)按模块名找挂钩子的地方。这里拿并行化之后的真模型
+    # 找一遍:名字对不上的话,不用等 8 张卡加载完权重才知道。
+    import qwen36_capture_acts as capture
+
+    moes, routed, lora_b, cap_dim = capture.find_modules(model)
+    check("抓激活要挂的地方都找得到:每层的 MoE、每层的专家模块、每层 3 个 LoRA B",
+          sorted(moes) == list(range(n_layers)) and sorted(routed) == list(range(n_layers))
+          and len(lora_b) == 3 * n_layers and cap_dim == model_config.layers[0].moe.routed_experts.inner_experts.dim,
+          f"MoE {len(moes)} 层,专家模块 {len(routed)} 层,LoRA B {len(lora_b)} 个,dim {cap_dim}")
 
     print(f"{RESULT_TAG} {'PASS' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1

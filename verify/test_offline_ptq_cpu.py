@@ -296,6 +296,48 @@ def section_b_extra(tmp: str) -> None:
           p.stdout[-500:] + p.stderr[-500:])
 
 
+def section_jobs(tmp: str) -> None:
+    """--jobs:多进程量化的结果必须和单进程逐位相同(否则同一条命令换台机器就复现不了)。"""
+    print("\n=== B. 多进程 (--jobs) ===")
+    src = os.path.join(tmp, "src_efd")
+    acts = os.path.join(tmp, "acts")
+    one = os.path.join(tmp, "dst_jobs1")
+    many = os.path.join(tmp, "dst_jobs3")
+    p1 = run("run", "--in", src, "--out", one, "--bits", "3", "--acts", acts)
+    p3 = run("run", "--in", src, "--out", many, "--bits", "3", "--acts", acts, "--jobs", "3")
+    ok = p1.returncode == 0 and p3.returncode == 0
+    check("--jobs 1 和 --jobs 3 都退出码 0", ok, p1.stderr[-600:] + p3.stdout[-600:] + p3.stderr[-600:])
+    if not ok:
+        return
+    a, b = read_dir(one), read_dir(many)
+    diff = [k for k in a if not torch.equal(a[k], b[k])]
+    check("--jobs 3 的产物和 --jobs 1 逐位相同", set(a) == set(b) and not diff, str(diff[:3]))
+    with open(os.path.join(many, "ptq_manifest.json"), encoding="utf-8") as fh:
+        man3 = json.load(fh)
+    with open(os.path.join(one, "ptq_manifest.json"), encoding="utf-8") as fh:
+        man1 = json.load(fh)
+    check("manifest 记了进程数", man3.get("jobs") == 3 and man1.get("jobs") == 1)
+    check("两边每层的 SNR 记录一样", all(
+        man1["layers"][ln]["w13_snr"] == man3["layers"][ln]["w13_snr"]
+        and man1["layers"][ln]["w2_snr"] == man3["layers"][ln]["w2_snr"] for ln in man1["layers"]))
+    check("输出里说明了并行度", "3 个进程" in p3.stdout and "单进程" in p1.stdout)
+
+    # 混合精度 + 多进程:保留的专家照样原样直通
+    keep = os.path.join(tmp, "keep_jobs.json")
+    with open(keep, "w", encoding="utf-8") as fh:
+        json.dump({"0": [1], "1": [0, 2]}, fh)
+    kept = os.path.join(tmp, "dst_jobs_keep")
+    p = run("run", "--in", src, "--out", kept, "--bits", "3", "--acts", acts, "--jobs", "2", "--keep-hot", keep)
+    if p.returncode != 0:
+        check("--jobs 配 --keep-hot 退出码 0", False, p.stdout[-600:] + p.stderr[-600:])
+        return
+    c = read_dir(kept)
+    base = read_dir(src)
+    k0 = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+    check("--jobs 配 --keep-hot:保留的专家没动,其余和不保留时一样",
+          torch.equal(c[k0][1], base[k0][1]) and torch.equal(c[k0][0], a[k0][0]) and not torch.equal(c[k0][0], base[k0][0]))
+
+
 # ---------------------------------------------------------------- C
 def section_c() -> None:
     print("\n=== C. 2bit 三档对比(会影响排期)===")
@@ -348,6 +390,7 @@ def main() -> int:
         section_b(tmp, "efd")
         section_b(tmp, "edf")
         section_b_extra(tmp)
+        section_jobs(tmp)
     section_c()
     print(f"\n================ {_ok} 项通过, {_fail} 项失败 ================")
     return 1 if _fail else 0
