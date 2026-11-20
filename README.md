@@ -214,8 +214,11 @@ conda activate lqq-train && export PYTHONPATH=$REPO/src:$PYTHONPATH && export AS
 第 1 步的闸门 5、6 已经验了配置和挂载点,这一条多验一次真的前向):
 
 ```bash
-cd $REPO && python verify/probe_capture_moe_cpu.py
+source $ASCEND_SET_ENV_PATH && cd $REPO && python verify/probe_capture_moe_cpu.py
 ```
+
+要以"结论:通过。"结尾(前面会有一屏 `aclInit` / `Invalid device ID` 之类的报错,那是因为
+故意没给它卡,不用管)。
 
 **建议先试一层**(4 步前向,约 0.5 GB),确认这条路在真模型上是通的:
 
